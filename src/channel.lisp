@@ -110,6 +110,18 @@
     (loop for b = (chan-read-byte c) until (= b 10) do (vector-push-extend b acc))
     (utf8->string (coerce acc '(simple-array (unsigned-byte 8) (*))))))
 
+(defun chan-read-all (c)
+  "Read all remaining channel data until EOF; return a fresh byte vector.  Used
+   by callers (e.g. git-over-SSH) that consume a stream of unknown length."
+  (let ((out (make-array 4096 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0)))
+    (loop until (and (zerop (chan-avail c)) (chan-eof c)) do
+      (if (zerop (chan-avail c))
+          (chan-pump c)
+          (let ((n (chan-avail c)) (start (chan-in-pos c)))
+            (dotimes (i n) (vector-push-extend (aref (chan-in c) (+ start i)) out))
+            (setf (chan-in-pos c) (+ start n)))))
+    (coerce out '(simple-array (unsigned-byte 8) (*)))))
+
 (defun chan-write (c bytes)
   (let ((bytes (to-u8v bytes)) (pos 0))
     (loop while (< pos (length bytes)) do

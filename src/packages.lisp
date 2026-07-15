@@ -16,6 +16,10 @@
    #:connect #:disconnect #:with-connection
    ;; running commands
    #:run #:exec
+   ;; raw channel (for streaming protocols like git-over-SSH)
+   #:open-session #:chan-exec #:chan-subsystem #:chan-close #:chan-send-eof
+   #:chan-write #:chan-read-exact #:chan-read-byte #:chan-read-line #:chan-read-all
+   #:chan-avail #:chan-eof
    ;; file transfer (scp)
    #:upload #:download #:scp-upload #:scp-download
    ;; sftp
