@@ -110,3 +110,29 @@
   (with-connection (conn host :port port :user user :identity identity
                               :host-key-verifier host-key-verifier)
     (scp-download conn remote-path local-path)))
+
+;;; ---- SFTP ------------------------------------------------------------------
+(defmacro with-sftp ((var host &rest connect-args) &body body)
+  "Connect to HOST, open an SFTP session bound to VAR, run BODY, and tear down."
+  (let ((conn (gensym)))
+    `(with-connection (,conn ,host ,@connect-args)
+       (let ((,var (sftp-open-session ,conn)))
+         ,@body))))
+
+(defun sftp-download (host remote local
+                      &key (port 22) (user (default-user)) identity host-key-verifier)
+  "Download REMOTE from HOST to LOCAL via SFTP.  Returns bytes."
+  (with-sftp (s host :port port :user user :identity identity :host-key-verifier host-key-verifier)
+    (sftp-get s remote local)))
+
+(defun sftp-upload (host local remote
+                    &key (port 22) (user (default-user)) identity host-key-verifier)
+  "Upload LOCAL to REMOTE on HOST via SFTP.  Returns bytes."
+  (with-sftp (s host :port port :user user :identity identity :host-key-verifier host-key-verifier)
+    (sftp-put s local remote)))
+
+(defun sftp-list (host path
+                  &key (port 22) (user (default-user)) identity host-key-verifier)
+  "List directory PATH on HOST via SFTP.  Returns entry names."
+  (with-sftp (s host :port port :user user :identity identity :host-key-verifier host-key-verifier)
+    (sftp-ls s path)))

@@ -24,4 +24,5 @@ FFI; the only platform dependency is SBCL's sb-bsd-sockets."
      (:file "auth")
      (:file "channel")
      (:file "scp")
+     (:file "sftp")
      (:file "client")))))

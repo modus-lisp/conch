@@ -18,6 +18,11 @@
    #:run #:exec
    ;; file transfer (scp)
    #:upload #:download #:scp-upload #:scp-download
+   ;; sftp
+   #:with-sftp #:sftp-open-session
+   #:sftp-get #:sftp-put #:sftp-ls #:sftp-realpath
+   #:sftp-mkdir #:sftp-rmdir #:sftp-remove
+   #:sftp-download #:sftp-upload #:sftp-list
    ;; keys / host verification
    #:load-private-key #:*known-hosts* #:host-key-fingerprint
    ;; conditions

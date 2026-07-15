@@ -76,15 +76,20 @@
         (make-chan :conn conn :local-id 0 :remote-id remote
                    :send-window swin :recv-window *initial-window* :send-max smax)))))
 
-(defun chan-exec (c command)
+(defun chan-request-1 (c request arg what)
+  "Send a channel request of type REQUEST carrying one string ARG, want_reply t,
+   and await CHANNEL_SUCCESS / CHANNEL_FAILURE."
   (let ((w (make-writer)))
     (w-byte w +msg-channel-request+) (w-u32 w (chan-remote-id c))
-    (w-string w "exec") (w-bool w t) (w-string w command)
+    (w-string w request) (w-bool w t) (w-string w arg)
     (write-packet (chan-conn c) (writer-bytes w)))
   (loop for p = (read-payload (chan-conn c)) for msg = (aref p 0)
         do (cond ((= msg +msg-channel-success+) (return t))
-                 ((= msg +msg-channel-failure+) (ssh-error "exec request refused by server"))
+                 ((= msg +msg-channel-failure+) (ssh-error "~a request refused by server" what))
                  (t (chan-process c p)))))
+
+(defun chan-exec (c command) (chan-request-1 c "exec" command "exec"))
+(defun chan-subsystem (c name) (chan-request-1 c "subsystem" name (format nil "subsystem ~a" name)))
 
 ;;; ---- read / write ----------------------------------------------------------
 (defun chan-read-exact (c n)
