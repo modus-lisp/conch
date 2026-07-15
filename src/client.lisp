@@ -96,3 +96,17 @@
                               :host-key-verifier host-key-verifier)
     (multiple-value-bind (out err status) (exec-command conn command)
       (values (utf8->string out) status (utf8->string err)))))
+
+(defun upload (host local-path remote-path
+               &key (port 22) (user (default-user)) identity host-key-verifier)
+  "Copy the local file LOCAL-PATH to REMOTE-PATH on HOST via scp.  Returns bytes sent."
+  (with-connection (conn host :port port :user user :identity identity
+                              :host-key-verifier host-key-verifier)
+    (scp-upload conn local-path remote-path)))
+
+(defun download (host remote-path local-path
+                 &key (port 22) (user (default-user)) identity host-key-verifier)
+  "Copy REMOTE-PATH on HOST into the local file LOCAL-PATH via scp.  Returns bytes."
+  (with-connection (conn host :port port :user user :identity identity
+                              :host-key-verifier host-key-verifier)
+    (scp-download conn remote-path local-path)))

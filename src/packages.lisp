@@ -16,6 +16,8 @@
    #:connect #:disconnect #:with-connection
    ;; running commands
    #:run #:exec
+   ;; file transfer (scp)
+   #:upload #:download #:scp-upload #:scp-download
    ;; keys / host verification
    #:load-private-key #:*known-hosts* #:host-key-fingerprint
    ;; conditions
