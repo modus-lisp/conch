@@ -16,6 +16,9 @@
 (defconstant +msg-service-accept+ 6)
 (defconstant +msg-kexinit+ 20)
 (defconstant +msg-newkeys+ 21)
+(defconstant +msg-global-request+ 80)
+(defconstant +msg-request-success+ 81)
+(defconstant +msg-request-failure+ 82)
 (defconstant +msg-kex-ecdh-init+ 30)
 (defconstant +msg-kex-ecdh-reply+ 31)
 
@@ -117,6 +120,12 @@
         for msg = (aref p 0)
         do (cond ((= msg +msg-ignore+))
                  ((= msg +msg-debug+))
+                 ((= msg +msg-global-request+)          ; e.g. hostkeys-00@openssh.com
+                  (let ((r (make-reader p 1)))
+                    (r-cstring r)                        ; request name
+                    (when (r-bool r)                     ; want_reply → we don't support it
+                      (write-packet conn (make-array 1 :element-type '(unsigned-byte 8)
+                                                       :initial-element +msg-request-failure+)))))
                  ((= msg +msg-disconnect+)
                   (let ((r (make-reader p 1)))
                     (let ((code (r-u32 r)) (desc (r-cstring r)))
