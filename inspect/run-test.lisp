@@ -14,7 +14,7 @@
         (run "127.0.0.1" "echo 'hello from conch'; id -un; uname -sm; expr 6 '*' 7"
              :port 2222 :user "claude" :identity "/tmp/sshtest/client_ed25519"
              :host-key-verifier
-             (lambda (blob pub) (declare (ignore pub))
+             (lambda (blob)
                (format t "~&[verified host key ~a]~%" (host-key-fingerprint blob))))
       (format t "~%exit-status: ~a~%--- stdout ---~%~a" status out)
       (when (plusp (length err)) (format t "--- stderr ---~%~a" err))

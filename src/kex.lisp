@@ -11,7 +11,9 @@
 
 (defparameter *kex-algs*
   '("curve25519-sha256" "curve25519-sha256@libssh.org" "kex-strict-c-v00@openssh.com"))
-(defparameter *hostkey-algs* '("ssh-ed25519"))
+(defparameter *hostkey-algs*
+  '("ssh-ed25519" "ecdsa-sha2-nistp256" "ecdsa-sha2-nistp384"
+    "rsa-sha2-512" "rsa-sha2-256"))
 (defparameter *ciphers* '("chacha20-poly1305@openssh.com"))
 (defparameter *macs* '("hmac-sha2-256"))          ; unused with the AEAD cipher
 (defparameter *compression* '("none"))
@@ -80,21 +82,62 @@
   "OpenSSH-style SHA256 fingerprint of a host key blob (\"SHA256:<base64>\")."
   (concatenate 'string "SHA256:" (base64-nopad (n:sha256 (to-u8v host-key-blob)))))
 
+;;; ---- host-key signature verification (ed25519 / RSA / ECDSA) ----------------
+(defun verify-host-signature (hk-alg k-s h sig)
+  "Verify the server's signature SIG over the exchange hash H using its host key
+   blob K-S, per the negotiated host-key algorithm HK-ALG.  T / NIL.  Ed25519 is
+   verified with natrium; RSA and ECDSA are verified with the sibling `seal`
+   library's primitives."
+  (cond
+    ((string= hk-alg "ssh-ed25519")
+     (n:ed25519-verify (parse-ed25519-blob k-s "host key") h
+                       (parse-ed25519-blob sig "signature")))
+    ((or (string= hk-alg "rsa-sha2-256") (string= hk-alg "rsa-sha2-512"))
+     (verify-rsa-host k-s h sig (if (string= hk-alg "rsa-sha2-512") :sha512 :sha256)))
+    ((or (string= hk-alg "ecdsa-sha2-nistp256") (string= hk-alg "ecdsa-sha2-nistp384"))
+     (verify-ecdsa-host k-s h sig))
+    (t (ssh-error "unsupported host-key algorithm ~a" hk-alg))))
+
+(defun verify-rsa-host (k-s h sig hash-alg)
+  "ssh-rsa host key = string \"ssh-rsa\" ‖ mpint e ‖ mpint n; signature blob =
+   string \"rsa-sha2-*\" ‖ string raw-signature."
+  (let ((kr (make-reader k-s)) (sr (make-reader sig)))
+    (unless (string= (r-cstring kr) "ssh-rsa")
+      (ssh-error "unexpected RSA host-key blob"))
+    (let* ((e (r-mpint kr)) (n (r-mpint kr))
+           (key (seal:make-rsa-public-key :n n :e e)))
+      (r-cstring sr)                                ; signature type
+      (seal:rsa-pkcs1-verify key hash-alg h (r-string sr)))))
+
+(defun verify-ecdsa-host (k-s h sig)
+  "ecdsa-sha2-nistpNNN host key = string type ‖ string curve ‖ string Q; signature
+   blob = string type ‖ string (mpint r ‖ mpint s)."
+  (let ((kr (make-reader k-s)) (sr (make-reader sig)))
+    (r-cstring kr)                                  ; "ecdsa-sha2-nistpNNN"
+    (let* ((curve-name (r-cstring kr))
+           (q (r-string kr))
+           (curve (if (string= curve-name "nistp384") seal:*p384* seal:*p256*))
+           (digest (if (string= curve-name "nistp384") (n:sha384 h) (n:sha256 h)))
+           (point (seal:ec-decode-point curve q)))
+      (r-cstring sr)                                ; signature type
+      (let ((br (make-reader (r-string sr))))
+        (seal:ecdsa-verify curve point digest (r-mpint br) (r-mpint br))))))
+
 ;;; ---- the exchange -----------------------------------------------------------
 (defun do-kex (conn &key host-key-verifier)
   "Run one key exchange to completion (through NEWKEYS).  HOST-KEY-VERIFIER, if
-   given, is called with (host-key-blob ed25519-public-key) after the signature
-   checks out — it should signal to reject an untrusted host.  Returns H."
+   given, is called with the host-key blob after the signature checks out — it
+   should signal to reject an untrusted host.  Returns H."
   (let ((i-c (build-kexinit)) i-s)
     (write-packet conn i-c)                        ; KEXINIT first (strict-KEX)
     (setf i-s (expect-msg conn +msg-kexinit+ "KEXINIT"))
     (let* ((sk (parse-kexinit i-s))
            (strict (and (member "kex-strict-s-v00@openssh.com" (getf sk :kex) :test #'string=) t)))
       (negotiate *kex-algs* (getf sk :kex) "kex algorithm")
-      (negotiate *hostkey-algs* (getf sk :hostkey) "host-key algorithm")
       (negotiate *ciphers* (getf sk :enc-c2s) "cipher")
       (negotiate *ciphers* (getf sk :enc-s2c) "cipher")
-      (multiple-value-bind (priv q-c) (n:x25519-keypair)
+      (let ((hk-alg (negotiate *hostkey-algs* (getf sk :hostkey) "host-key algorithm")))
+       (multiple-value-bind (priv q-c) (n:x25519-keypair)
         (let ((w (make-writer)))
           (w-byte w +msg-kex-ecdh-init+) (w-string w q-c)
           (write-packet conn (writer-bytes w)))
@@ -104,13 +147,11 @@
                (q-s (r-string rr))                 ; server ephemeral public
                (sig (r-string rr))                 ; signature over H
                (k (be->integer (n:x25519 priv q-s)))
-               (h (compute-exchange-hash conn i-c i-s k-s q-c q-s k))
-               (host-pub (parse-ed25519-blob k-s "host key"))
-               (sig-bytes (parse-ed25519-blob sig "signature")))
-          (unless (n:ed25519-verify host-pub h sig-bytes)
+               (h (compute-exchange-hash conn i-c i-s k-s q-c q-s k)))
+          (unless (verify-host-signature hk-alg k-s h sig)
             (error 'ssh-host-key-error :message "host-key signature verification failed"
                                        :fingerprint (host-key-fingerprint k-s)))
-          (when host-key-verifier (funcall host-key-verifier k-s host-pub))
+          (when host-key-verifier (funcall host-key-verifier k-s))
           (unless (ssh-conn-session-id conn) (setf (ssh-conn-session-id conn) h))
           (setf (ssh-conn-server-host-key conn) k-s)
           (let* ((sid (ssh-conn-session-id conn))
@@ -124,7 +165,7 @@
             (expect-msg conn +msg-newkeys+ "NEWKEYS")
             (setf (ssh-conn-recv-cipher conn) (make-openssh-cipher key-s2c))
             (when strict (setf (ssh-conn-recv-seq conn) 0))
-            h))))))
+            h)))))))
 
 ;;; ---- base64 (no padding, for fingerprints) ---------------------------------
 (defparameter +b64+ "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")

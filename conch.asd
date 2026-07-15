@@ -9,7 +9,7 @@ FFI; the only platform dependency is SBCL's sb-bsd-sockets."
   :version "0.0.1"
   :author "ynniv"
   :license "MIT"
-  :depends-on ("natrium" "sb-bsd-sockets")
+  :depends-on ("natrium" "seal" "sb-bsd-sockets")
   :serial t
   :components
   ((:module "src"
@@ -21,6 +21,7 @@ FFI; the only platform dependency is SBCL's sb-bsd-sockets."
      (:file "transport")
      (:file "cipher")
      (:file "kex")
+     (:file "host-keys")
      (:file "auth")
      (:file "channel")
      (:file "scp")

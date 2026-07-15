@@ -24,6 +24,6 @@
    #:sftp-mkdir #:sftp-rmdir #:sftp-remove
    #:sftp-download #:sftp-upload #:sftp-list
    ;; keys / host verification
-   #:load-private-key #:*known-hosts* #:host-key-fingerprint
+   #:load-private-key #:host-key-fingerprint #:make-known-hosts-verifier
    ;; conditions
    #:ssh-error #:ssh-protocol-error #:ssh-host-key-error #:ssh-auth-error))

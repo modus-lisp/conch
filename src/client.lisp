@@ -61,15 +61,20 @@
 (defun default-user ()
   (or (sb-ext:posix-getenv "USER") (sb-ext:posix-getenv "LOGNAME") "root"))
 
-(defun connect (host &key (port 22) (user (default-user)) identity host-key-verifier)
+(defun connect (host &key (port 22) (user (default-user)) identity host-key-verifier
+                          (known-hosts t))
   "Open an authenticated SSH connection to HOST and return the live SSH-CONN.
-   IDENTITY is the path to an OpenSSH Ed25519 private key."
+   IDENTITY is the path to an OpenSSH Ed25519 private key.  HOST-KEY-VERIFIER
+   overrides the default, which — when KNOWN-HOSTS is true — checks the server
+   against ~/.ssh/known_hosts (trust-on-first-use)."
   (multiple-value-bind (sock stream) (tcp-connect host port)
     (let ((conn (make-ssh-conn :socket sock :stream stream)) (ok nil))
       (unwind-protect
            (progn
              (exchange-versions conn)
-             (do-kex conn :host-key-verifier host-key-verifier)
+             (do-kex conn :host-key-verifier
+                     (or host-key-verifier
+                         (and known-hosts (make-known-hosts-verifier host :port port))))
              (request-service conn "ssh-userauth")
              (unless identity (ssh-error "no identity key supplied"))
              (multiple-value-bind (secret pub) (load-private-key identity)
