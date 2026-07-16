@@ -16,6 +16,8 @@
    #:connect #:disconnect #:with-connection
    ;; running commands
    #:run #:exec
+   ;; server (RFC 4252-4254 server role: KEX + publickey auth + exec sessions)
+   #:serve #:serve-connection #:tcp-listen #:accept-conn
    ;; raw channel (for streaming protocols like git-over-SSH)
    #:open-session #:chan-exec #:chan-subsystem #:chan-close #:chan-send-eof
    #:chan-write #:chan-read-exact #:chan-read-byte #:chan-read-line #:chan-read-all
