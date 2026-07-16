@@ -173,20 +173,24 @@
     (w-byte w +msg-channel-data+) (w-u32 w chan) (w-string w bytes)
     (write-packet conn (writer-bytes w))))
 
-(defun server-serve-session (conn exec-handler)
-  "Accept a session channel and service one exec/shell request by calling
-   EXEC-HANDLER with (command-string-or-NIL) → a string (or (values string
-   exit-code)).  Streams the result as CHANNEL_DATA, then EOF/exit-status/CLOSE."
+(defun server-serve-session (conn handler)
+  "Accept a session channel and hand its exec/shell request to HANDLER, called as
+   (COMMAND CHAN).  COMMAND is the exec string (or NIL for a shell); CHAN is a
+   duplex channel — read the client's stdin with chan-read-exact/chan-read-all
+   and write stdout with chan-write.  HANDLER returns an exit code.  We then send
+   exit-status and close the channel gracefully."
   (let* ((co (expect-msg conn +msg-channel-open+ "CHANNEL_OPEN"))
          (cr (make-reader co 1))
-         (ctype (r-cstring cr))
-         (peer (r-u32 cr)))                              ; client's channel id
+         (ctype (r-cstring cr)) (peer (r-u32 cr))
+         (cli-window (r-u32 cr)) (cli-max (r-u32 cr)))
     (declare (ignore ctype))
-    (let ((chan 0))                                      ; our channel id
-      (let ((w (make-writer)))                           ; OPEN_CONFIRMATION
-        (w-byte w +msg-channel-open-confirmation+)
-        (w-u32 w peer) (w-u32 w chan) (w-u32 w #x100000) (w-u32 w 32768)
-        (write-packet conn (writer-bytes w)))
+    (let ((w (make-writer)))                             ; OPEN_CONFIRMATION
+      (w-byte w +msg-channel-open-confirmation+)
+      (w-u32 w peer) (w-u32 w 0) (w-u32 w *initial-window*) (w-u32 w *max-packet*)
+      (write-packet conn (writer-bytes w)))
+    (let ((c (make-chan :conn conn :local-id 0 :remote-id peer
+                        :send-window cli-window :send-max cli-max
+                        :recv-window *initial-window*)))
       (loop
         (let* ((p (read-payload conn)) (msg (aref p 0)))
           (cond
@@ -201,56 +205,54 @@
                       (let ((w (make-writer)))
                         (w-byte w +msg-channel-success+) (w-u32 w peer)
                         (write-packet conn (writer-bytes w))))
-                    (multiple-value-bind (out code)
-                        (funcall exec-handler command)
-                      (server-write-channel-data conn peer (string->utf8 (or out "")))
+                    (let ((code (funcall handler command c)))
                       (let ((w (make-writer)))            ; exit-status
                         (w-byte w +msg-channel-request+) (w-u32 w peer)
                         (w-string w "exit-status") (w-bool w nil) (w-u32 w (or code 0))
                         (write-packet conn (writer-bytes w)))
-                      (let ((w (make-writer)))            ; EOF then CLOSE
-                        (w-byte w +msg-channel-eof+) (w-u32 w peer)
-                        (write-packet conn (writer-bytes w)))
-                      (let ((w (make-writer)))
-                        (w-byte w +msg-channel-close+) (w-u32 w peer)
-                        (write-packet conn (writer-bytes w)))
-                      ;; graceful close: let the client drain our output and send
-                      ;; its own CLOSE before we tear the socket down (else a
-                      ;; premature close RSTs the client's unread receive buffer)
-                      (handler-case
-                          (loop for q = (read-payload conn)
-                                until (= (aref q 0) +msg-channel-close+))
-                        (error () nil))
+                      (unless (chan-eof c) (ignore-errors (chan-send-eof c)))
+                      (ignore-errors (chan-close c))       ; CLOSE + drain the client's CLOSE
                       (return))))
                  (want-reply
                   (let ((w (make-writer)))
                     (w-byte w +msg-channel-failure+) (w-u32 w peer)
                     (write-packet conn (writer-bytes w)))))))
-            ((= msg +msg-channel-eof+))
+            ((= msg +msg-channel-eof+) (setf (chan-eof c) t))
             ((= msg +msg-channel-close+) (return))
-            ((= msg +msg-channel-data+))                 ; ignore client stdin for exec
-            ((= msg +msg-channel-window-adjust+))))))))
+            ((or (= msg +msg-channel-data+) (= msg +msg-channel-window-adjust+))
+             (chan-process c p))))))))                    ; buffer stdin / window updates
 
 ;;; ---- top-level ---------------------------------------------------------------
 
-(defun serve-connection (conn host-secret host-public &key authorized-keys exec)
-  "Run the full server handshake on an accepted CONN and service one session."
+(defun exec->handler (exec)
+  "Adapt a one-shot EXEC (command -> (values output exit-code)) to a streaming
+   session handler (command chan -> exit-code)."
+  (lambda (command chan)
+    (multiple-value-bind (out code)
+        (funcall (or exec (lambda (c) (declare (ignore c)) "")) command)
+      (chan-write chan (string->utf8 (or out "")))
+      (or code 0))))
+
+(defun serve-connection (conn host-secret host-public &key authorized-keys exec handler)
+  "Run the full server handshake on an accepted CONN and service one session with
+   HANDLER (command chan -> exit-code) or, if none, the one-shot EXEC."
   (unwind-protect
        (progn
          (server-exchange-versions conn)
          (server-do-kex conn host-secret host-public)
          (server-authenticate conn :authorized-keys authorized-keys)
-         (server-serve-session conn (or exec (lambda (cmd) (declare (ignore cmd)) ""))))
+         (server-serve-session conn (or handler (exec->handler exec))))
     (ignore-errors (send-raw conn #()))
     (ignore-errors (sb-bsd-sockets:socket-close (ssh-conn-socket conn)))))
 
-(defun serve (port &key host-key authorized-keys exec (once nil))
+(defun serve (port &key host-key authorized-keys exec handler (once nil))
   "Serve SSH on PORT.  HOST-KEY is the path to an unencrypted OpenSSH Ed25519
    host private key.  AUTHORIZED-KEYS restricts which client keys may log in (a
    list of 32-byte public keys or blobs; NIL accepts any key with a valid
-   signature).  EXEC is called with the requested command (a string, or NIL for
-   an interactive shell) and returns the output string (optionally a second value
-   exit code).  With :ONCE, serve exactly one connection and return."
+   signature).  HANDLER (command chan -> exit-code) services each session with a
+   duplex channel — for interactive protocols like git-over-SSH; EXEC (command ->
+   (values output exit-code)) is the simple one-shot form.  With :ONCE, serve
+   exactly one connection and return."
   (multiple-value-bind (host-secret host-public) (load-private-key host-key)
     (let ((listen (tcp-listen port)))
       (format *error-output* "~&conch: SSH server listening on port ~d~%" port)
@@ -258,12 +260,9 @@
       (unwind-protect
            (loop
              (let ((conn (accept-conn listen)))
-               (if once
-                   (progn (serve-connection conn host-secret host-public
-                                            :authorized-keys authorized-keys :exec exec)
-                          (return))
-                   (handler-case
-                       (serve-connection conn host-secret host-public
-                                         :authorized-keys authorized-keys :exec exec)
-                     (error () nil)))))            ; a bad connection shouldn't kill the server
+               (flet ((handle () (serve-connection conn host-secret host-public
+                                                    :authorized-keys authorized-keys
+                                                    :exec exec :handler handler)))
+                 (if once (progn (handle) (return))
+                     (handler-case (handle) (error () nil))))))   ; one bad conn shouldn't kill the server
         (ignore-errors (sb-bsd-sockets:socket-close listen))))))
