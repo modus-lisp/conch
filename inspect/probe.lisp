@@ -1,8 +1,10 @@
 ;;;; probe.lisp — foundation smoke test against a real OpenSSH server:
 ;;;; version exchange + parse the server's KEXINIT name-lists.
 (require :asdf)
-(push #p"/home/claude/natrium/" asdf:*central-registry*)
-(push #p"/home/claude/conch/" asdf:*central-registry*)
+;; Sibling repos, found relative to this file so the workspace can live anywhere.
+(asdf:initialize-source-registry
+ (let ((here (make-pathname :name nil :type nil :defaults *load-truename*)))
+   `(:source-registry (:tree ,(merge-pathnames "../../" here)) :inherit-configuration)))
 (asdf:load-system :conch)
 (in-package :conch)
 

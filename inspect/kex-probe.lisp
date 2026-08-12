@@ -3,8 +3,10 @@
 ;;;; SERVICE_REQUEST/SERVICE_ACCEPT to prove the chacha20-poly1305@openssh.com
 ;;;; cipher works end to end.
 (require :asdf)
-(push #p"/home/claude/natrium/" asdf:*central-registry*)
-(push #p"/home/claude/conch/" asdf:*central-registry*)
+;; Sibling repos, found relative to this file so the workspace can live anywhere.
+(asdf:initialize-source-registry
+ (let ((here (make-pathname :name nil :type nil :defaults *load-truename*)))
+   `(:source-registry (:tree ,(merge-pathnames "../../" here)) :inherit-configuration)))
 (asdf:load-system :conch)
 (in-package :conch)
 

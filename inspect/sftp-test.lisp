@@ -1,7 +1,10 @@
 ;;;; sftp-test.lisp — SFTP put/get/ls/mkdir/realpath over real OpenSSH.  Run from conch/.
 (require :asdf)
 (require :sb-bsd-sockets)
-(push #p"/home/claude/natrium/" asdf:*central-registry*)
+;; Sibling repos, found relative to this file so the workspace can live anywhere.
+(asdf:initialize-source-registry
+ (let ((here (make-pathname :name nil :type nil :defaults *load-truename*)))
+   `(:source-registry (:tree ,(merge-pathnames "../../" here)) :inherit-configuration)))
 (asdf:load-system :natrium)
 (dolist (f '("packages" "conditions" "buffer" "transport" "cipher" "kex"
              "auth" "channel" "scp" "sftp" "client"))
