@@ -173,54 +173,219 @@
     (w-byte w +msg-channel-data+) (w-u32 w chan) (w-string w bytes)
     (write-packet conn (writer-bytes w))))
 
+(defconstant +msg-global-request+ 80)
+(defconstant +msg-request-failure+ 82)
+
+(defparameter *forward-connect-timeout* 10
+  "Seconds to wait for a direct-tcpip forward to reach its target.")
+
 (defun server-serve-session (conn handler)
-  "Accept a session channel and hand its exec/shell request to HANDLER, called as
-   (COMMAND CHAN).  COMMAND is the exec string (or NIL for a shell); CHAN is a
-   duplex channel — read the client's stdin with chan-read-exact/chan-read-all
-   and write stdout with chan-write.  HANDLER returns an exit code.  We then send
-   exit-status and close the channel gracefully."
-  (let* ((co (expect-msg conn +msg-channel-open+ "CHANNEL_OPEN"))
-         (cr (make-reader co 1))
-         (ctype (r-cstring cr)) (peer (r-u32 cr))
-         (cli-window (r-u32 cr)) (cli-max (r-u32 cr)))
-    (declare (ignore ctype))
-    (let ((w (make-writer)))                             ; OPEN_CONFIRMATION
-      (w-byte w +msg-channel-open-confirmation+)
-      (w-u32 w peer) (w-u32 w 0) (w-u32 w *initial-window*) (w-u32 w *max-packet*)
-      (write-packet conn (writer-bytes w)))
-    (let ((c (make-chan :conn conn :local-id 0 :remote-id peer
-                        :send-window cli-window :send-max cli-max
-                        :recv-window *initial-window*)))
-      (loop
-        (let* ((p (read-payload conn)) (msg (aref p 0)))
-          (cond
-            ((= msg +msg-channel-request+)
-             (let* ((r (make-reader p 1)) (rchan (r-u32 r)) (rtype (r-cstring r))
-                    (want-reply (r-bool r)))
-               (declare (ignore rchan))
-               (cond
-                 ((or (string= rtype "exec") (string= rtype "shell"))
-                  (let ((command (if (string= rtype "exec") (r-cstring r) nil)))
-                    (when want-reply
-                      (let ((w (make-writer)))
-                        (w-byte w +msg-channel-success+) (w-u32 w peer)
-                        (write-packet conn (writer-bytes w))))
-                    (let ((code (funcall handler command c)))
-                      (let ((w (make-writer)))            ; exit-status
-                        (w-byte w +msg-channel-request+) (w-u32 w peer)
-                        (w-string w "exit-status") (w-bool w nil) (w-u32 w (or code 0))
-                        (write-packet conn (writer-bytes w)))
-                      (unless (chan-eof c) (ignore-errors (chan-send-eof c)))
-                      (ignore-errors (chan-close c))       ; CLOSE + drain the client's CLOSE
-                      (return))))
-                 (want-reply
-                  (let ((w (make-writer)))
-                    (w-byte w +msg-channel-failure+) (w-u32 w peer)
-                    (write-packet conn (writer-bytes w)))))))
-            ((= msg +msg-channel-eof+) (setf (chan-eof c) t))
-            ((= msg +msg-channel-close+) (return))
-            ((or (= msg +msg-channel-data+) (= msg +msg-channel-window-adjust+))
-             (chan-process c p))))))))                    ; buffer stdin / window updates
+  "Backwards-compatible single-session entry point.  See SERVER-SERVE-CHANNELS."
+  (serve-channels conn handler))
+
+;;; A connection carries several channels at once: one session, plus a
+;;; direct-tcpip channel for every `ssh -L` stream the client opens.  So the read
+;;; loop below owns the socket and does nothing slow — it routes packets and
+;;; hands the slow parts (the session handler, and each forward's local->remote
+;;; pump) to their own threads.  Writes from those threads are safe because
+;;; WRITE-PACKET serialises on the connection's send lock.
+;;;
+;;; That also fixes a deadlock the single-channel version had: HANDLER was called
+;;; from inside the read loop, so a handler writing more than the initial window
+;;; could never receive the WINDOW_ADJUST that would let it continue.
+
+(defun serve-channels (conn handler &key (allow-forwarding t))
+  "Service every channel the client opens until it hangs up.
+
+   Session channels are handed to HANDLER (command chan -> exit-code) on their own
+   thread; CHAN-PTY holds the client's terminal if it asked for one.  With
+   ALLOW-FORWARDING (the default, matching OpenSSH's AllowTcpForwarding), the
+   client may also open direct-tcpip channels — this is what `ssh -L` uses, and
+   it lets an authenticated client reach anything routable from this process."
+  (let ((chans (make-hash-table :test 'eql))
+        (next-local 0)
+        (threads '()))
+    (labels
+        ((send (&rest parts)
+           (let ((w (make-writer)))
+             (loop for (kind val) on parts by #'cddr
+                   do (ecase kind
+                        (:byte (w-byte w val)) (:u32 (w-u32 w val))
+                        (:string (w-string w val)) (:bool (w-bool w val))))
+             (write-packet conn (writer-bytes w))))
+         (reply (ok peer)
+           (send :byte (if ok +msg-channel-success+ +msg-channel-failure+) :u32 peer))
+         (open-confirm (peer local)
+           (send :byte +msg-channel-open-confirmation+ :u32 peer :u32 local
+                 :u32 *initial-window* :u32 *max-packet*))
+         (open-fail (peer reason text)
+           (send :byte +msg-channel-open-failure+ :u32 peer :u32 reason
+                 :string (string->utf8 text) :string (string->utf8 "")))
+         (new-chan (peer window max)
+           (let ((c (make-chan :conn conn :local-id next-local :remote-id peer
+                               :send-window window :send-max max
+                               :recv-window *initial-window*
+                               :server-side t)))
+             (setf (gethash next-local chans) c)
+             (incf next-local)
+             c))
+         (finish-chan (c code)
+           (ignore-errors
+            (send :byte +msg-channel-request+ :u32 (chan-remote-id c)
+                  :string (string->utf8 "exit-status") :bool nil :u32 (or code 0)))
+           (unless (chan-eof c) (ignore-errors (chan-send-eof c)))
+           (ignore-errors (chan-close c))
+           (remhash (chan-local-id c) chans)))
+
+      (unwind-protect
+           (loop
+             (let* ((p (handler-case (read-payload conn) (error () nil))))
+               (unless p (return))
+               (let ((msg (aref p 0)) (r (make-reader p 1)))
+                 (cond
+
+                   ;; ---- a new channel ------------------------------------------
+                   ((= msg +msg-channel-open+)
+                    (let* ((ctype (r-cstring r)) (peer (r-u32 r))
+                           (window (r-u32 r)) (max (r-u32 r)))
+                      (cond
+                        ((string= ctype "session")
+                         (open-confirm peer (chan-local-id (new-chan peer window max))))
+
+                        ((string= ctype "direct-tcpip")
+                         ;; RFC 4254 s7.2: host/port to reach, then the originator.
+                         (let ((host (r-cstring r)) (port (r-u32 r)))
+                           (if (not allow-forwarding)
+                               (open-fail peer 1 "forwarding disabled")
+                               (handler-case
+                                   (let ((sock (tcp-connect-timeout host port)))
+                                     (let ((c (new-chan peer window max)))
+                                       (setf (chan-socket c) sock)
+                                       (open-confirm peer (chan-local-id c))
+                                       ;; target -> client, on its own thread; the
+                                       ;; other direction is routed by this loop.
+                                       (push (sb-thread:make-thread
+                                              (lambda () (forward-pump c))
+                                              :name (format nil "conch-forward ~a:~d" host port))
+                                             threads)))
+                                 (error (e)
+                                   (declare (ignore e))
+                                   (open-fail peer 2 (format nil "connect to ~a:~d failed" host port))))))) 
+
+                        (t (open-fail peer 3 (format nil "unknown channel type ~a" ctype))))))
+
+                   ;; ---- a request on a channel ---------------------------------
+                   ((= msg +msg-channel-request+)
+                    (let* ((local (r-u32 r)) (rtype (r-cstring r)) (want-reply (r-bool r))
+                           (c (gethash local chans)))
+                      (cond
+                        ((null c) (when want-reply (reply nil 0)))
+
+                        ;; The client's terminal.  We do not allocate a real pty —
+                        ;; nothing here execs a foreign program that would need one —
+                        ;; we record what the client told us, which is exactly what an
+                        ;; in-process TUI needs in order to draw.
+                        ((string= rtype "pty-req")
+                         (let ((term (r-cstring r)) (cols (r-u32 r)) (rows (r-u32 r))
+                               (wpx (r-u32 r)) (hpx (r-u32 r)) (modes (r-string r)))
+                           (setf (chan-pty c)
+                                 (make-pty :term term :cols cols :rows rows
+                                           :width-px wpx :height-px hpx :modes modes))
+                           (when want-reply (reply t (chan-remote-id c)))))
+
+                        ((string= rtype "window-change")
+                         (let ((cols (r-u32 r)) (rows (r-u32 r))
+                               (wpx (r-u32 r)) (hpx (r-u32 r)))
+                           (let ((pty (chan-pty c)))
+                             (when pty
+                               (setf (pty-cols pty) cols (pty-rows pty) rows
+                                     (pty-width-px pty) wpx (pty-height-px pty) hpx)
+                               (when (pty-on-resize pty)
+                                 (ignore-errors (funcall (pty-on-resize pty) cols rows)))))
+                           ;; window-change is specified to carry want_reply false.
+                           (when want-reply (reply t (chan-remote-id c)))))
+
+                        ((or (string= rtype "exec") (string= rtype "shell"))
+                         (let ((command (if (string= rtype "exec") (r-cstring r) nil)))
+                           (when want-reply (reply t (chan-remote-id c)))
+                           (push (sb-thread:make-thread
+                                  (lambda ()
+                                    (finish-chan
+                                     c (handler-case (funcall handler command c)
+                                         (error () 1))))
+                                  :name "conch-session")
+                                 threads)))
+
+                        ;; env, signal, subsystem, x11-req, ...: politely no.
+                        (want-reply (reply nil (chan-remote-id c))))))
+
+                   ;; ---- data and lifecycle, routed to the owning channel --------
+                   ((or (= msg +msg-channel-data+) (= msg +msg-channel-extended-data+)
+                        (= msg +msg-channel-window-adjust+) (= msg +msg-channel-eof+)
+                        (= msg +msg-channel-close+))
+                    (let* ((local (r-u32 (make-reader p 1)))
+                           (c (gethash local chans)))
+                      (when c
+                        (chan-process c p)
+                        ;; A forward's client->target direction: whatever just
+                        ;; arrived goes straight out the socket.
+                        (when (chan-socket c)
+                          (cond ((= msg +msg-channel-data+) (forward-drain c))
+                                ((or (= msg +msg-channel-eof+) (= msg +msg-channel-close+))
+                                 (ignore-errors
+                                  (sb-bsd-sockets:socket-close (chan-socket c))))))
+                        (when (= msg +msg-channel-close+)
+                          (sb-thread:with-mutex ((chan-window-lock c))
+                            (sb-thread:condition-broadcast (chan-window-cv c)))
+                          (remhash local chans)))))
+
+                   ;; A global request (no-more-sessions@openssh.com, tcpip-forward
+                   ;; for `ssh -R`, ...).  We implement none, and a want_reply left
+                   ;; unanswered hangs the client, so always refuse explicitly.
+                   ((= msg +msg-global-request+)
+                    (let ((name (r-cstring r)) (want-reply (r-bool r)))
+                      (declare (ignore name))
+                      (when want-reply (send :byte +msg-request-failure+))))
+
+                   (t nil)))))
+
+        (dolist (c (loop for v being the hash-values of chans collect v))
+          (ignore-errors (when (chan-socket c) (sb-bsd-sockets:socket-close (chan-socket c)))))
+        (dolist (th threads) (ignore-errors (sb-thread:join-thread th :timeout 2)))))))
+
+;;; ---- direct-tcpip plumbing --------------------------------------------------
+
+(defun tcp-connect-timeout (host port)
+  "Connect to HOST:PORT, giving up rather than hanging a channel open forever."
+  (let ((sock (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))
+    (handler-case
+        (progn (sb-bsd-sockets:socket-connect sock (resolve-address host) port) sock)
+      (error (e) (ignore-errors (sb-bsd-sockets:socket-close sock)) (error e)))))
+
+(defun forward-drain (c)
+  "Everything buffered on the channel goes out to the forward's socket."
+  (let ((n (chan-avail c)))
+    (when (plusp n)
+      (let ((bytes (subseq (chan-in c) (chan-in-pos c) (+ (chan-in-pos c) n))))
+        (incf (chan-in-pos c) n)
+        (handler-case (sb-bsd-sockets:socket-send (chan-socket c) bytes (length bytes))
+          (error () (ignore-errors (chan-close c))))))))
+
+(defun forward-pump (c)
+  "Target -> client, until either end goes away."
+  (let ((buf (make-array 32768 :element-type '(unsigned-byte 8))))
+    (unwind-protect
+         (loop
+           (multiple-value-bind (data n)
+               (handler-case (sb-bsd-sockets:socket-receive (chan-socket c) buf nil)
+                 (error () (values nil 0)))
+             (declare (ignore data))
+             (when (or (null n) (zerop n)) (return))
+             (handler-case (chan-write c (subseq buf 0 n))
+               (error () (return)))))
+      (ignore-errors (sb-bsd-sockets:socket-close (chan-socket c)))
+      (ignore-errors (chan-send-eof c))
+      (ignore-errors (chan-close c)))))
 
 ;;; ---- top-level ---------------------------------------------------------------
 
@@ -233,7 +398,8 @@
       (chan-write chan (string->utf8 (or out "")))
       (or code 0))))
 
-(defun serve-connection (conn host-secret host-public &key authorized-keys exec handler)
+(defun serve-connection (conn host-secret host-public
+                         &key authorized-keys exec handler (allow-forwarding t))
   "Run the full server handshake on an accepted CONN and service one session with
    HANDLER (command chan -> exit-code) or, if none, the one-shot EXEC."
   (unwind-protect
@@ -241,18 +407,25 @@
          (server-exchange-versions conn)
          (server-do-kex conn host-secret host-public)
          (server-authenticate conn :authorized-keys authorized-keys)
-         (server-serve-session conn (or handler (exec->handler exec))))
+         (serve-channels conn (or handler (exec->handler exec))
+                                 :allow-forwarding allow-forwarding))
     (ignore-errors (send-raw conn #()))
     (ignore-errors (sb-bsd-sockets:socket-close (ssh-conn-socket conn)))))
 
-(defun serve (port &key host-key authorized-keys exec handler (once nil))
+(defun serve (port &key host-key authorized-keys exec handler (once nil)
+                          (allow-forwarding t))
   "Serve SSH on PORT.  HOST-KEY is the path to an unencrypted OpenSSH Ed25519
    host private key.  AUTHORIZED-KEYS restricts which client keys may log in (a
    list of 32-byte public keys or blobs; NIL accepts any key with a valid
    signature).  HANDLER (command chan -> exit-code) services each session with a
    duplex channel — for interactive protocols like git-over-SSH; EXEC (command ->
    (values output exit-code)) is the simple one-shot form.  With :ONCE, serve
-   exactly one connection and return."
+   exactly one connection and return.
+
+   ALLOW-FORWARDING (default T, as OpenSSH's AllowTcpForwarding is) lets an
+   authenticated client open direct-tcpip channels — `ssh -L`.  That reaches
+   anything routable from this process, so pass NIL where the login is meant to
+   be confined to the session itself."
   (multiple-value-bind (host-secret host-public) (load-private-key host-key)
     (let ((listen (tcp-listen port)))
       (format *error-output* "~&conch: SSH server listening on port ~d~%" port)
@@ -262,7 +435,16 @@
              (let ((conn (accept-conn listen)))
                (flet ((handle () (serve-connection conn host-secret host-public
                                                     :authorized-keys authorized-keys
-                                                    :exec exec :handler handler)))
-                 (if once (progn (handle) (return))
-                     (handler-case (handle) (error () nil))))))   ; one bad conn shouldn't kill the server
+                                                    :exec exec :handler handler
+                                                    :allow-forwarding allow-forwarding)))
+                 (if once
+                     (progn (handle) (return))
+                     ;; A thread per connection.  Serving them one at a time meant
+                     ;; a single long-lived client — an `ssh -N` tunnel, or anyone
+                     ;; sitting in an interactive session — blocked every later
+                     ;; login until it hung up.  One bad connection still must not
+                     ;; kill the server, hence the handler-case inside.
+                     (sb-thread:make-thread
+                      (lambda () (handler-case (handle) (error () nil)))
+                      :name "conch-connection")))))
         (ignore-errors (sb-bsd-sockets:socket-close listen))))))

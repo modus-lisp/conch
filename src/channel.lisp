@@ -24,7 +24,25 @@
   (in (make-array 4096 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0))
   (in-pos 0)
   (err (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0))
-  (eof nil) (closed nil) (close-sent nil) (exit nil))
+  (eof nil) (closed nil) (close-sent nil) (exit nil)
+  ;; Server side.  PTY is the client's terminal, as described by its pty-req and
+  ;; kept current by window-change — a full-screen TUI needs the size and needs
+  ;; to hear about resizes.  SOCKET is the far end of a direct-tcpip forward.
+  (pty nil) (socket nil)
+  ;; SERVER-SIDE means "somebody else owns the connection's read loop".  A client
+  ;; channel may read the socket whenever it needs to (it is the only reader); a
+  ;; server channel must NEVER, because the multiplexing loop is already reading
+  ;; and two readers desynchronise the cipher.  So instead of pumping for a
+  ;; WINDOW_ADJUST, a server channel waits to be told one arrived.
+  (server-side nil)
+  (window-lock (sb-thread:make-mutex :name "chan-window"))
+  (window-cv (sb-thread:make-waitqueue :name "chan-window")))
+
+(defstruct pty
+  (term "vt100") (cols 80) (rows 24) (width-px 0) (height-px 0) (modes #())
+  ;; Called with (COLS ROWS) on every window-change, so a TUI can redraw without
+  ;; polling for a size it has no other way to learn.
+  (on-resize nil))
 
 (defun chan-avail (c) (- (fill-pointer (chan-in c)) (chan-in-pos c)))
 
@@ -49,7 +67,11 @@
        (r-u32 r) (r-u32 r)
        (loop for b across (r-string r) do (vector-push-extend b (chan-err c))))
       ((= msg +msg-channel-window-adjust+)
-       (r-u32 r) (incf (chan-send-window c) (r-u32 r)))
+       (r-u32 r)
+       (let ((inc (r-u32 r)))
+         (sb-thread:with-mutex ((chan-window-lock c))
+           (incf (chan-send-window c) inc)
+           (sb-thread:condition-broadcast (chan-window-cv c)))))
       ((= msg +msg-channel-eof+) (setf (chan-eof c) t))
       ((= msg +msg-channel-close+) (setf (chan-closed c) t (chan-eof c) t))
       ((= msg +msg-channel-request+)
@@ -122,16 +144,28 @@
             (setf (chan-in-pos c) (+ start n)))))
     (coerce out '(simple-array (unsigned-byte 8) (*)))))
 
+(defun chan-await-window (c)
+  "Block until the peer has granted send window."
+  (if (chan-server-side c)
+      (sb-thread:with-mutex ((chan-window-lock c))
+        (loop while (and (<= (chan-send-window c) 0) (not (chan-closed c)))
+              do (sb-thread:condition-wait (chan-window-cv c) (chan-window-lock c)
+                                           :timeout 30)))
+      (loop while (<= (chan-send-window c) 0) do (chan-pump c))))
+
 (defun chan-write (c bytes)
   (let ((bytes (to-u8v bytes)) (pos 0))
     (loop while (< pos (length bytes)) do
-      (loop while (<= (chan-send-window c) 0) do (chan-pump c))   ; await WINDOW_ADJUST
+      (chan-await-window c)
+      (when (chan-closed c) (return))
       (let* ((chunk (min (- (length bytes) pos) (chan-send-window c) (chan-send-max c)))
              (w (make-writer)))
         (w-byte w +msg-channel-data+) (w-u32 w (chan-remote-id c))
         (w-string w (subseq bytes pos (+ pos chunk)))
         (write-packet (chan-conn c) (writer-bytes w))
-        (decf (chan-send-window c) chunk) (incf pos chunk)))))
+        (sb-thread:with-mutex ((chan-window-lock c))
+          (decf (chan-send-window c) chunk))
+        (incf pos chunk)))))
 
 (defun chan-send-eof (c)
   (let ((w (make-writer)))
@@ -144,7 +178,10 @@
       (w-byte w +msg-channel-close+) (w-u32 w (chan-remote-id c))
       (write-packet (chan-conn c) (writer-bytes w)))
     (setf (chan-close-sent c) t))
-  (loop until (chan-closed c) do (chan-pump c)))
+  ;; Only a channel that owns the reader may wait for the peer's CLOSE here; on
+  ;; the server the multiplexing loop sees it and retires the channel.
+  (unless (chan-server-side c)
+    (loop until (chan-closed c) do (chan-pump c))))
 
 ;;; ---- exec-command (collect all output) -------------------------------------
 (defun exec-command (conn command)

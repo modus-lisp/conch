@@ -17,7 +17,10 @@
    ;; running commands
    #:run #:exec
    ;; server (RFC 4252-4254 server role: KEX + publickey auth + exec sessions)
-   #:serve #:serve-connection #:tcp-listen #:accept-conn
+   #:serve #:serve-connection #:serve-channels #:tcp-listen #:accept-conn
+   ;; the client's terminal, for full-screen TUIs over a session channel
+   #:chan-pty #:pty #:pty-p #:pty-term #:pty-cols #:pty-rows
+   #:pty-width-px #:pty-height-px #:pty-on-resize
    ;; raw channel (for streaming protocols like git-over-SSH)
    #:open-session #:chan-exec #:chan-subsystem #:chan-close #:chan-send-eof
    #:chan-write #:chan-read-exact #:chan-read-byte #:chan-read-line #:chan-read-all

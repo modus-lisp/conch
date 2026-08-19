@@ -32,7 +32,13 @@
   send-cipher                            ; NIL (plaintext) or a cipher object
   recv-cipher
   session-id                             ; H of the first key exchange
-  server-host-key)                       ; the verified host public key blob
+  server-host-key                        ; the verified host public key blob
+  ;; One connection now carries several channels at once — a session and any
+  ;; number of forwarded TCP streams — and each is pumped by its own thread.  The
+  ;; send path is not re-entrant (a packet is framed, encrypted and counted
+  ;; against SEND-SEQ, and interleaving two of those corrupts the stream and
+  ;; desynchronises the cipher), so every writer takes this first.
+  (send-lock (sb-thread:make-mutex :name "conch-send")))
 
 ;;; ---- socket I/O ------------------------------------------------------------
 (defun resolve-address (host)
@@ -82,11 +88,14 @@
 ;;; ---- binary packet protocol (RFC 4253 §6) ----------------------------------
 (defun write-packet (conn payload)
   "Frame, (encrypt,) and send PAYLOAD (a byte vector whose first byte is the
-   message number)."
-  (if (ssh-conn-send-cipher conn)
-      (cipher-send-packet conn payload)
-      (plaintext-send-packet conn payload))
-  (setf (ssh-conn-send-seq conn) (logand (1+ (ssh-conn-send-seq conn)) #xffffffff)))
+   message number).  Serialised on the connection's SEND-LOCK: framing and the
+   sequence-number bump must be one atomic step, or two channels writing at once
+   interleave their packets and desynchronise the cipher."
+  (sb-thread:with-recursive-lock ((ssh-conn-send-lock conn))
+    (if (ssh-conn-send-cipher conn)
+        (cipher-send-packet conn payload)
+        (plaintext-send-packet conn payload))
+    (setf (ssh-conn-send-seq conn) (logand (1+ (ssh-conn-send-seq conn)) #xffffffff))))
 
 (defun plaintext-send-packet (conn payload)
   (let* ((plen (length payload))
