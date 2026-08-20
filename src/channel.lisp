@@ -36,7 +36,11 @@
   ;; WINDOW_ADJUST, a server channel waits to be told one arrived.
   (server-side nil)
   (window-lock (sb-thread:make-mutex :name "chan-window"))
-  (window-cv (sb-thread:make-waitqueue :name "chan-window")))
+  (window-cv (sb-thread:make-waitqueue :name "chan-window"))
+  ;; Same rule for the read direction: a server channel may not pump the socket
+  ;; to get its own stdin, so the read loop hands it data and rings this.
+  (data-lock (sb-thread:make-mutex :name "chan-data"))
+  (data-cv (sb-thread:make-waitqueue :name "chan-data")))
 
 (defstruct pty
   (term "vt100") (cols 80) (rows 24) (width-px 0) (height-px 0) (modes #())
@@ -60,7 +64,9 @@
       ((= msg +msg-channel-data+)
        (r-u32 r)
        (let ((d (r-string r)))
-         (loop for b across d do (vector-push-extend b (chan-in c)))
+         (sb-thread:with-mutex ((chan-data-lock c))
+           (loop for b across d do (vector-push-extend b (chan-in c)))
+           (sb-thread:condition-broadcast (chan-data-cv c)))
          (decf (chan-recv-window c) (length d))
          (chan-maybe-adjust-window c)))
       ((= msg +msg-channel-extended-data+)
@@ -72,8 +78,14 @@
          (sb-thread:with-mutex ((chan-window-lock c))
            (incf (chan-send-window c) inc)
            (sb-thread:condition-broadcast (chan-window-cv c)))))
-      ((= msg +msg-channel-eof+) (setf (chan-eof c) t))
-      ((= msg +msg-channel-close+) (setf (chan-closed c) t (chan-eof c) t))
+      ((= msg +msg-channel-eof+)
+       (setf (chan-eof c) t)
+       (sb-thread:with-mutex ((chan-data-lock c))
+         (sb-thread:condition-broadcast (chan-data-cv c))))
+      ((= msg +msg-channel-close+)
+       (setf (chan-closed c) t (chan-eof c) t)
+       (sb-thread:with-mutex ((chan-data-lock c))
+         (sb-thread:condition-broadcast (chan-data-cv c))))
       ((= msg +msg-channel-request+)
        (r-u32 r)
        (let ((req (r-cstring r)))
@@ -114,12 +126,20 @@
 (defun chan-subsystem (c name) (chan-request-1 c "subsystem" name (format nil "subsystem ~a" name)))
 
 ;;; ---- read / write ----------------------------------------------------------
+(defun chan-await-data (c)
+  "Block until more channel data arrives (or the channel ends)."
+  (if (chan-server-side c)
+      (sb-thread:with-mutex ((chan-data-lock c))
+        (when (and (zerop (chan-avail c)) (not (chan-eof c)) (not (chan-closed c)))
+          (sb-thread:condition-wait (chan-data-cv c) (chan-data-lock c) :timeout 60)))
+      (chan-pump c)))
+
 (defun chan-read-exact (c n)
   "Read exactly N bytes of channel data (blocking); error on premature EOF."
   (loop while (< (chan-avail c) n)
         do (if (or (chan-eof c) (chan-closed c))
                (ssh-error "channel: unexpected EOF (have ~d, need ~d)" (chan-avail c) n)
-               (chan-pump c)))
+               (chan-await-data c)))
   (let ((start (chan-in-pos c)))
     (setf (chan-in-pos c) (+ start n))
     (coerce (subseq (chan-in c) start (+ start n)) '(simple-array (unsigned-byte 8) (*)))))
@@ -138,7 +158,7 @@
   (let ((out (make-array 4096 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0)))
     (loop until (and (zerop (chan-avail c)) (chan-eof c)) do
       (if (zerop (chan-avail c))
-          (chan-pump c)
+          (chan-await-data c)
           (let ((n (chan-avail c)) (start (chan-in-pos c)))
             (dotimes (i n) (vector-push-extend (aref (chan-in c) (+ start i)) out))
             (setf (chan-in-pos c) (+ start n)))))
