@@ -77,7 +77,12 @@
                          (and known-hosts (make-known-hosts-verifier host :port port))))
              (request-service conn "ssh-userauth")
              (unless identity (ssh-error "no identity key supplied"))
-             (multiple-value-bind (secret pub) (load-private-key identity)
+             ;; IDENTITY is a path, or (SECRET-32 PUBLIC-32) already in hand (a key kept in
+             ;; the device's keychain, which never goes to a file)
+             (multiple-value-bind (secret pub)
+                 (if (consp identity)
+                     (values (first identity) (second identity))
+                     (load-private-key identity))
                (userauth-publickey conn user secret pub))
              (setf ok t)
              conn)
