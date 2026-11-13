@@ -442,6 +442,78 @@
         (let ((closes (loop for (p . h) in handles collect (%handle-request s +fxp-close+ h))))
           (dolist (id closes) (ignore-errors (sftp-response s id))))))))
 
+(defun sftp-walk (s root fn &key (width 8) (reads 2))
+  "Every folder under ROOT, and ROOT, listed -- WIDTH of them at once, READS readdirs in flight on each, depth
+   first.  FN is called with (PATH ENTRIES) for each batch of a folder's entries as it comes (SFTP-ENTRY
+   structs, \".\" and \"..\" left out), and returns the paths of the folders among them to go into (a symlink to
+   a folder: the caller's choice); with (PATH :UNREADABLE) for a folder that cannot be opened or read; and
+   with (PATH :DONE) once a folder is finished.  For a disk-usage scan: a deep tree is listed with many round
+   trips overlapping, not one folder after another.  Interrupted (a cancel), it reads what it had in flight and
+   closes what it opened."
+  (let ((pending (list root))
+        (queue '())                          ; requests in flight, oldest first: (kind path id)
+        (open 0)                             ; folders being listed
+        (dirs (make-hash-table :test 'equal)))   ; path -> (handle reads-in-flight eof-p)
+    (labels ((enqueue (op) (setf queue (nconc queue (list op))))
+             (cancelled-p (e) (search "cancelled" (ssh-error-message e)))
+             (open-next ()
+               (loop while (and pending (< open width))
+                     do (let ((p (pop pending)))
+                          (incf open)
+                          (enqueue (list :open p (%path-request s +fxp-opendir+ p))))))
+             (ask (p st)
+               (incf (second st))
+               (enqueue (list :read p (%handle-request s +fxp-readdir+ (first st)))))
+             (finish-if-done (p st)
+               ;; at its end with nothing left in flight: closed, and done
+               (when (and (third st) (zerop (second st)))
+                 (enqueue (list :close p (%handle-request s +fxp-close+ (first st))))
+                 (remhash p dirs)
+                 (decf open)
+                 (funcall fn p :done))))
+      (unwind-protect
+           (progn
+             (open-next)
+             (loop while queue
+                   do (destructuring-bind (kind p id) (first queue)
+                        (ecase kind
+                          (:open
+                           (let ((h (handler-case (sftp-handle-of s id "opendir")
+                                      (ssh-error (e) (if (cancelled-p e) (error e) nil)))))
+                             (pop queue)                              ; answered: no longer in flight
+                             (if h
+                                 (let ((st (list h 0 nil)))
+                                   (setf (gethash p dirs) st)
+                                   (dotimes (i reads) (ask p st)))
+                                 (progn (decf open)
+                                        (funcall fn p :unreadable)
+                                        (funcall fn p :done)))))
+                          (:read
+                           (let ((batch (handler-case (sftp-names-of s id :attrs t)
+                                          (ssh-error (e) (if (cancelled-p e) (error e) :error))))
+                                 (st (gethash p dirs)))
+                             (pop queue)
+                             (decf (second st))
+                             (cond ((or (null batch) (eq batch :error))
+                                    (when (and (eq batch :error) (not (third st))) (funcall fn p :unreadable))
+                                    (setf (third st) t)
+                                    (finish-if-done p st))
+                                   (t
+                                    (unless (third st) (ask p st))  ; the next batch asked for at once
+                                    (let ((entries (%dots-out batch)))
+                                      (when entries
+                                        (dolist (sub (funcall fn p entries)) (push sub pending))))))))
+                          (:close
+                           (pop queue)
+                           (ignore-errors (sftp-response s id)))))
+                      (open-next)))
+        ;; a cancel: what is in flight read and dropped, what is open closed -- without the hook
+        (let ((*wait-hook* nil))
+          (dolist (op queue) (ignore-errors (sftp-response s (third op))))
+          (let ((closes (loop for st being the hash-values of dirs
+                              collect (%handle-request s +fxp-close+ (first st)))))
+            (dolist (id closes) (ignore-errors (sftp-response s id)))))))))
+
 (defun %sftp-path-op (s type path what)
   (multiple-value-bind (rtype r) (sftp-response s (%path-request s type path))
     (cond ((= rtype +fxp-attrs+) (read-attrs r))

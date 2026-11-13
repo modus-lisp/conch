@@ -31,7 +31,7 @@
    #:with-sftp #:sftp-open-session
    #:sftp-get #:sftp-put #:sftp-ls #:sftp-realpath
    #:sftp-mkdir #:sftp-rmdir #:sftp-remove
-   #:open-direct-tcpip #:sftp-request #:sftp-response #:sftp-call #:sftp-peek-dirs #:sftp-read-range #:sftp-write-range #:*sftp-window* #:*sftp-chunk*
+   #:open-direct-tcpip #:exec-lines #:sftp-walk #:sftp-request #:sftp-response #:sftp-call #:sftp-peek-dirs #:sftp-read-range #:sftp-write-range #:*sftp-window* #:*sftp-chunk*
    #:sftp-entries #:sftp-map-entries #:sftp-entry #:sftp-entry-name #:sftp-entry-attrs #:sftp-entry-size
    #:sftp-entry-mtime #:sftp-entry-kind #:sftp-stat #:sftp-lstat #:sftp-rename #:attrs-kind
    #:known-hosts-trust #:ssh-host-key-blob #:ssh-host-key-kind

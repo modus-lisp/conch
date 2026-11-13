@@ -30,6 +30,10 @@
   ;; this one is up.
   via
   jump
+  ;; the client's channels, by their local id: a connection carries several at once (an SFTP session, a
+  ;; command beside it, a tunnel), and a message read for one is handed to the one it is for
+  (chans (make-hash-table))
+  (next-chan 0)
   (client-id "" :type string)
   (server-id "" :type string)
   (send-seq 0 :type (unsigned-byte 32))

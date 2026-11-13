@@ -93,46 +93,66 @@
          (when (string= req "exit-status") (setf (chan-exit c) (r-u32 r)))))
       (t nil))))                          ; success/failure/other: ignore here
 
-(defun chan-pump (c) (chan-process c (read-payload (chan-conn c))))
+;;; ---- several channels on one connection ----
+;;; Each client channel has its own local id and is registered on its connection.  Whatever reads -- a
+;;; channel waiting for its data, an open waiting for its confirmation -- hands a message for another channel
+;;; to that channel (its data waits in its buffer) and goes on reading for its own.
+
+(defun %chan-msg-p (msg) (<= +msg-channel-open-confirmation+ msg +msg-channel-failure+))
+(defun %recipient (p) (r-u32 (make-reader p 1)))
+
+(defun %read-for (conn id)
+  "The next message for the channel whose local id is ID (or not for a channel at all), messages for the
+   other channels handed to them on the way."
+  (loop
+    (let ((p (read-payload conn)))
+      (if (and (%chan-msg-p (aref p 0)) (/= (%recipient p) id))
+          (let ((other (gethash (%recipient p) (ssh-conn-chans conn))))
+            (when other (chan-process other p)))       ; one already gone: dropped
+          (return p)))))
+
+(defun chan-pump (c) (chan-process c (%read-for (chan-conn c) (chan-local-id c))))
 
 ;;; ---- open / exec -----------------------------------------------------------
+(defun %open-channel (conn type write-extra on-failure)
+  "Open a channel of TYPE (WRITE-EXTRA writes what follows the window and packet size) and return it,
+   registered; ON-FAILURE is called with the reason code and description when the server refuses."
+  (let ((id (prog1 (ssh-conn-next-chan conn) (incf (ssh-conn-next-chan conn))))
+        (w (make-writer)))
+    (w-byte w +msg-channel-open+) (w-string w type)
+    (w-u32 w id) (w-u32 w *initial-window*) (w-u32 w *max-packet*)
+    (when write-extra (funcall write-extra w))
+    (write-packet conn (writer-bytes w))
+    (let* ((p (%read-for conn id)) (r (make-reader p 1)))
+      (cond ((= (aref p 0) +msg-channel-open-confirmation+)
+             (r-u32 r)
+             (let* ((remote (r-u32 r)) (swin (r-u32 r)) (smax (r-u32 r))
+                    (c (make-chan :conn conn :local-id id :remote-id remote
+                                  :send-window swin :recv-window *initial-window* :send-max smax)))
+               (setf (gethash id (ssh-conn-chans conn)) c)
+               c))
+            ((= (aref p 0) +msg-channel-open-failure+)
+             (r-u32 r)
+             (let ((code (r-u32 r)) (desc (r-cstring r)))
+               (funcall on-failure code desc)))
+            (t (ssh-protocol-error "unexpected reply ~d to a ~a channel open" (aref p 0) type))))))
+
 (defun open-session (conn)
-  (let ((w (make-writer)))
-    (w-byte w +msg-channel-open+) (w-string w "session")
-    (w-u32 w 0) (w-u32 w *initial-window*) (w-u32 w *max-packet*)
-    (write-packet conn (writer-bytes w)))
-  (let ((p (read-payload conn)))
-    (unless (= (aref p 0) +msg-channel-open-confirmation+)
-      (ssh-error "session channel open failed (message ~d)" (aref p 0)))
-    (let ((r (make-reader p 1)))
-      (r-u32 r)                                    ; our id (0)
-      (let ((remote (r-u32 r)) (swin (r-u32 r)) (smax (r-u32 r)))
-        (make-chan :conn conn :local-id 0 :remote-id remote
-                   :send-window swin :recv-window *initial-window* :send-max smax)))))
+  (%open-channel conn "session" nil
+                 (lambda (code desc) (ssh-error "session channel open failed (~d~@[: ~a~])" code
+                                                (and (plusp (length desc)) desc)))))
 
 (defun open-direct-tcpip (conn host port &key (originator "127.0.0.1") (originator-port 0))
   "A channel to HOST:PORT made by the server at the other end of CONN -- a jump host's tunnel to what is
    behind it (RFC 4254 §7.2, what `ssh -J` and `ssh -L` use).  HOST is the jump host's to resolve, so a
    name only its network knows works."
-  (let ((w (make-writer)))
-    (w-byte w +msg-channel-open+) (w-string w "direct-tcpip")
-    (w-u32 w 0) (w-u32 w *initial-window*) (w-u32 w *max-packet*)
-    (w-string w host) (w-u32 w port) (w-string w originator) (w-u32 w originator-port)
-    (write-packet conn (writer-bytes w)))
-  (let* ((p (read-payload conn)) (r (make-reader p 1)))
-    (cond ((= (aref p 0) +msg-channel-open-confirmation+)
-           (r-u32 r)
-           (let ((remote (r-u32 r)) (swin (r-u32 r)) (smax (r-u32 r)))
-             (make-chan :conn conn :local-id 0 :remote-id remote
-                        :send-window swin :recv-window *initial-window* :send-max smax)))
-          ((= (aref p 0) +msg-channel-open-failure+)
-           (r-u32 r)
-           (let ((code (r-u32 r)) (desc (r-cstring r)))
-             (ssh-error "the jump host could not reach ~a:~d (~a~@[: ~a~])" host port
-                        (case code (1 "not allowed") (2 "connection failed") (3 "no tunnels")
-                              (4 "out of resources") (t (format nil "reason ~d" code)))
-                        (and (plusp (length desc)) desc))))
-          (t (ssh-protocol-error "unexpected reply ~d to a direct-tcpip open" (aref p 0))))))
+  (%open-channel conn "direct-tcpip"
+                 (lambda (w) (w-string w host) (w-u32 w port) (w-string w originator) (w-u32 w originator-port))
+                 (lambda (code desc)
+                   (ssh-error "the jump host could not reach ~a:~d (~a~@[: ~a~])" host port
+                              (case code (1 "not allowed") (2 "connection failed") (3 "no tunnels")
+                                    (4 "out of resources") (t (format nil "reason ~d" code)))
+                              (and (plusp (length desc)) desc)))))
 
 (defun chan-request-1 (c request arg what)
   "Send a channel request of type REQUEST carrying one string ARG, want_reply t,
@@ -141,7 +161,7 @@
     (w-byte w +msg-channel-request+) (w-u32 w (chan-remote-id c))
     (w-string w request) (w-bool w t) (w-string w arg)
     (write-packet (chan-conn c) (writer-bytes w)))
-  (loop for p = (read-payload (chan-conn c)) for msg = (aref p 0)
+  (loop for p = (%read-for (chan-conn c) (chan-local-id c)) for msg = (aref p 0)
         do (cond ((= msg +msg-channel-success+) (return t))
                  ((= msg +msg-channel-failure+) (ssh-error "~a request refused by server" what))
                  (t (chan-process c p)))))
@@ -237,7 +257,8 @@
   ;; Only a channel that owns the reader may wait for the peer's CLOSE here; on
   ;; the server the multiplexing loop sees it and retires the channel.
   (unless (chan-server-side c)
-    (loop until (chan-closed c) do (chan-pump c))))
+    (loop until (chan-closed c) do (chan-pump c))
+    (remhash (chan-local-id c) (ssh-conn-chans (chan-conn c)))))
 
 ;;; ---- exec-command (collect all output) -------------------------------------
 (defun exec-command (conn command)
@@ -250,3 +271,31 @@
     (values (coerce (subseq (chan-in c) (chan-in-pos c)) '(simple-array (unsigned-byte 8) (*)))
             (coerce (chan-err c) '(simple-array (unsigned-byte 8) (*)))
             (chan-exit c))))
+
+(defun exec-lines (conn command fn)
+  "Run COMMAND on a channel of its own (beside any others on CONN -- an SFTP session goes on as it does), its
+   stdin closed at once, and call FN with each line of its output as it arrives -- for a long command, its
+   progress.  Returns its exit status (NIL if the server sent none)."
+  (let ((c (open-session conn)) (line (make-array 128 :element-type '(unsigned-byte 8) :adjustable t
+                                                      :fill-pointer 0)))
+    (unwind-protect
+         (progn
+           (chan-exec c command)
+           (chan-send-eof c)
+           (loop
+             (loop while (plusp (chan-avail c))
+                   do (let ((b (aref (chan-in c) (chan-in-pos c))))
+                        (incf (chan-in-pos c))
+                        (if (= b 10)
+                            (progn (funcall fn (utf8->string (coerce line '(simple-array (unsigned-byte 8) (*)))))
+                                   (setf (fill-pointer line) 0))
+                            (vector-push-extend b line))))
+             (chan-compact c)
+             (when (or (chan-eof c) (chan-closed c)) (return))
+             (chan-pump c))
+           (when (plusp (length line))
+             (funcall fn (utf8->string (coerce line '(simple-array (unsigned-byte 8) (*))))))
+           (loop until (or (chan-closed c) (chan-exit c)) do (chan-pump c))
+           (chan-exit c))
+      ;; a cancel or an error part way: the channel closed, and its rest read and dropped, without the hook
+      (let ((*wait-hook* nil)) (ignore-errors (chan-close c))))))
