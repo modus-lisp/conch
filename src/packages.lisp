@@ -31,8 +31,16 @@
    #:with-sftp #:sftp-open-session
    #:sftp-get #:sftp-put #:sftp-ls #:sftp-realpath
    #:sftp-mkdir #:sftp-rmdir #:sftp-remove
+   #:sftp-request #:sftp-response #:sftp-call #:sftp-peek-dirs #:sftp-read-range #:sftp-write-range #:*sftp-window* #:*sftp-chunk*
+   #:sftp-entries #:sftp-map-entries #:sftp-entry #:sftp-entry-name #:sftp-entry-attrs #:sftp-entry-size
+   #:sftp-entry-mtime #:sftp-entry-kind #:sftp-stat #:sftp-lstat #:sftp-rename #:attrs-kind
+   #:known-hosts-trust #:ssh-host-key-blob #:ssh-host-key-kind
+   #:userauth-methods #:userauth-password #:userauth-keyboard-interactive #:userauth-with-password
    #:sftp-download #:sftp-upload #:sftp-list
    ;; keys / host verification
    #:load-private-key #:host-key-fingerprint #:make-known-hosts-verifier
    ;; conditions
-   #:ssh-error #:ssh-protocol-error #:ssh-host-key-error #:ssh-auth-error))
+   #:ssh-error #:ssh-protocol-error #:ssh-host-key-error #:ssh-auth-error
+   #:ssh-error-message #:ssh-host-key-fingerprint
+   ;; an app's UI while a read waits
+   #:*wait-hook* #:at-safe-point-p))

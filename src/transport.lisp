@@ -57,7 +57,48 @@
   (write-sequence bytes (ssh-conn-stream conn))
   (force-output (ssh-conn-stream conn)))
 
+(defvar *mid-packet* nil
+  "True while a packet is partly read: its first bytes are in, the rest are not.  Not a SAFE POINT.")
+(defvar *mid-sftp* nil
+  "True while an SFTP message is partly read or partly written (sftp.lisp).  Not a SAFE POINT.")
+
+(defun at-safe-point-p ()
+  "True when conch is waiting for the first bytes of a packet, with no packet and no SFTP message half
+   read or half written: the moment *WAIT-HOOK* may itself use the connection -- send SFTP requests and
+   read their responses (SFTP-RESPONSE sets aside, by request id, any it reads that are not its own).
+   Anywhere else, another request would split a packet or a message in two."
+  (not (or *mid-packet* *mid-sftp*)))
+
+(defvar *rescan* nil
+  "While an SFTP response is waited for: a function true once that response has turned up some other way --
+   read and set aside by what a *WAIT-HOOK* did -- so the wait stops reading the socket for it.")
+
+(defvar *wait-hook* nil
+  "NIL, or a function of no arguments called about every 20 ms while a read waits for the server:
+   an app's way to keep its UI alive and to let its user give up.  Returning :ABORT ends the wait
+   with an SSH-ERROR \"cancelled\" -- at the next SAFE POINT, so the connection stays usable (what was in
+   flight is drained by whatever was waiting for it).")
+
+(defun await-input (conn)
+  "Return once CONN has input (or has closed), calling *WAIT-HOOK* while it waits.  Not while it runs: what
+   the hook does on the connection itself waits plainly, or every wait inside it would call it again."
+  (let* ((s (ssh-conn-stream conn))
+         (fd (ignore-errors (sb-sys:fd-stream-fd s)))
+         (hook *wait-hook*))
+    (loop until (or (listen s)
+                    (if fd (sb-sys:wait-until-fd-usable fd :input 0.02) (progn (sleep 0.02) nil)))
+          do (when (and (eq (let ((*wait-hook* nil)) (funcall hook)) :abort)
+                        ;; only where nothing is half read: a cancel must leave the connection usable --
+                        ;; anywhere else it waits the moment it takes to get to one
+                        (at-safe-point-p))
+               (error 'ssh-error :message "cancelled"))
+             ;; the hook may have read what this wait is for; at a safe point nothing is half read, so the
+             ;; wait can simply be abandoned (SFTP-RESPONSE looks again)
+             (when (and *rescan* (at-safe-point-p) (funcall *rescan*))
+               (throw 'sftp-rescan nil)))))
+
 (defun read-exact (conn n)
+  (when *wait-hook* (await-input conn))
   (let* ((buf (make-array n :element-type '(unsigned-byte 8)))
          (got (read-sequence buf (ssh-conn-stream conn))))
     (unless (= got n)
@@ -118,7 +159,7 @@
 
 (defun plaintext-recv-packet (conn)
   (let* ((plen (be->integer (read-exact conn 4)))
-         (rest (read-exact conn plen))
+         (rest (let ((*mid-packet* t)) (read-exact conn plen)))
          (pad (aref rest 0)))
     (subseq rest 1 (- plen pad))))
 

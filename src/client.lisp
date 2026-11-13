@@ -61,10 +61,12 @@
 (defun default-user ()
   (or (sb-ext:posix-getenv "USER") (sb-ext:posix-getenv "LOGNAME") "root"))
 
-(defun connect (host &key (port 22) (user (default-user)) identity host-key-verifier
+(defun connect (host &key (port 22) (user (default-user)) identity password host-key-verifier
                           (known-hosts t))
   "Open an authenticated SSH connection to HOST and return the live SSH-CONN.
-   IDENTITY is the path to an OpenSSH Ed25519 private key.  HOST-KEY-VERIFIER
+   IDENTITY is the path to an OpenSSH Ed25519 private key, or (SECRET PUBLIC); PASSWORD, a password
+   -- tried by password or keyboard-interactive auth, whichever the server takes, after IDENTITY if
+   both are given and the key was refused.  HOST-KEY-VERIFIER
    overrides the default, which — when KNOWN-HOSTS is true — checks the server
    against ~/.ssh/known_hosts (trust-on-first-use)."
   (multiple-value-bind (sock stream) (tcp-connect host port)
@@ -76,14 +78,19 @@
                      (or host-key-verifier
                          (and known-hosts (make-known-hosts-verifier host :port port))))
              (request-service conn "ssh-userauth")
-             (unless identity (ssh-error "no identity key supplied"))
+             (unless (or identity password) (ssh-error "no identity key or password supplied"))
              ;; IDENTITY is a path, or (SECRET-32 PUBLIC-32) already in hand (a key kept in
              ;; the device's keychain, which never goes to a file)
-             (multiple-value-bind (secret pub)
-                 (if (consp identity)
-                     (values (first identity) (second identity))
-                     (load-private-key identity))
-               (userauth-publickey conn user secret pub))
+             (if identity
+                 (handler-case
+                     (multiple-value-bind (secret pub)
+                         (if (consp identity)
+                             (values (first identity) (second identity))
+                             (load-private-key identity))
+                       (userauth-publickey conn user secret pub))
+                   (ssh-auth-error (e)
+                     (if password (userauth-with-password conn user password) (error e))))
+                 (userauth-with-password conn user password))
              (setf ok t)
              conn)
         (unless ok (ignore-errors (sb-bsd-sockets:socket-close (ssh-conn-socket conn))))))))

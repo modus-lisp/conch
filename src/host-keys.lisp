@@ -82,11 +82,19 @@
           (correct t)
           (known (error 'ssh-host-key-error
                         :message (format nil "HOST KEY CHANGED for ~a — possible man-in-the-middle" entry)
-                        :fingerprint (host-key-fingerprint k-s)))
+                        :fingerprint (host-key-fingerprint k-s) :key k-s :kind :changed))
           (add (known-hosts-append path entry keytype b64)
                (warn "conch: trusting new host ~a (~a); added to ~a"
                      entry (host-key-fingerprint k-s) path)
                t)
           (t (error 'ssh-host-key-error
                     :message (format nil "unknown host ~a" entry)
-                    :fingerprint (host-key-fingerprint k-s))))))))
+                    :fingerprint (host-key-fingerprint k-s) :key k-s :kind :unknown)))))))
+
+(defun known-hosts-trust (host key-blob &key (port 22) (path (known-hosts-path)))
+  "Record KEY-BLOB (an SSH-HOST-KEY-ERROR's SSH-HOST-KEY-BLOB) as HOST's key in PATH: what an app
+   does once its user has accepted an unknown host's fingerprint.  The next connection checks
+   against it."
+  (known-hosts-append path (host-entry-name host port)
+                      (r-cstring (make-reader key-blob)) (base64-encode (to-u8v key-blob)))
+  t)

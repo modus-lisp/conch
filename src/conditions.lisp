@@ -10,7 +10,11 @@
   (:report (lambda (c s) (format s "SSH protocol error: ~a" (ssh-error-message c)))))
 
 (define-condition ssh-host-key-error (ssh-error)
-  ((fingerprint :initarg :fingerprint :initform nil :reader ssh-host-key-fingerprint))
+  ((fingerprint :initarg :fingerprint :initform nil :reader ssh-host-key-fingerprint)
+   ;; the server's key blob and why it was refused -- :UNKNOWN (never seen: an app can ask its user and
+   ;; KNOWN-HOSTS-TRUST it) or :CHANGED (a different key from the one on record: never just accepted)
+   (key :initarg :key :initform nil :reader ssh-host-key-blob)
+   (kind :initarg :kind :initform nil :reader ssh-host-key-kind))
   (:report (lambda (c s) (format s "SSH host-key error: ~a" (ssh-error-message c)))))
 
 (define-condition ssh-auth-error (ssh-error) ()
