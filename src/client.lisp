@@ -62,15 +62,20 @@
   (or (sb-ext:posix-getenv "USER") (sb-ext:posix-getenv "LOGNAME") "root"))
 
 (defun connect (host &key (port 22) (user (default-user)) identity password host-key-verifier
-                          (known-hosts t))
+                          (known-hosts t) via)
   "Open an authenticated SSH connection to HOST and return the live SSH-CONN.
    IDENTITY is the path to an OpenSSH Ed25519 private key, or (SECRET PUBLIC); PASSWORD, a password
    -- tried by password or keyboard-interactive auth, whichever the server takes, after IDENTITY if
    both are given and the key was refused.  HOST-KEY-VERIFIER
    overrides the default, which — when KNOWN-HOSTS is true — checks the server
-   against ~/.ssh/known_hosts (trust-on-first-use)."
-  (multiple-value-bind (sock stream) (tcp-connect host port)
-    (let ((conn (make-ssh-conn :socket sock :stream stream)) (ok nil))
+   against ~/.ssh/known_hosts (trust-on-first-use).  VIA, a connection to a JUMP HOST: HOST:PORT is reached
+   through it (the jump host connects, and resolves HOST), as `ssh -J` does; once this connection is up it
+   owns VIA, and DISCONNECT closes both."
+  (multiple-value-bind (sock stream) (if via (values nil nil) (tcp-connect host port))
+    (let ((conn (if via
+                    (make-ssh-conn :via (open-direct-tcpip via host port))
+                    (make-ssh-conn :socket sock :stream stream)))
+          (ok nil))
       (unwind-protect
            (progn
              (exchange-versions conn)
@@ -92,15 +97,21 @@
                      (if password (userauth-with-password conn user password) (error e))))
                  (userauth-with-password conn user password))
              (setf ok t)
+             (when via (setf (ssh-conn-jump conn) via))
              conn)
-        (unless ok (ignore-errors (sb-bsd-sockets:socket-close (ssh-conn-socket conn))))))))
+        (unless ok
+          (if via
+              (let ((*wait-hook* nil)) (ignore-errors (chan-close (ssh-conn-via conn))))  ; the jump host stays the caller's
+              (ignore-errors (sb-bsd-sockets:socket-close (ssh-conn-socket conn)))))))))
 
 (defun disconnect (conn)
   (ignore-errors
    (let ((w (make-writer)))
      (w-byte w +msg-disconnect+) (w-u32 w 11) (w-string w "bye") (w-string w "")
      (write-packet conn (writer-bytes w))))
-  (ignore-errors (sb-bsd-sockets:socket-close (ssh-conn-socket conn))))
+  (if (ssh-conn-socket conn)
+      (ignore-errors (sb-bsd-sockets:socket-close (ssh-conn-socket conn)))
+      (when (ssh-conn-jump conn) (disconnect (ssh-conn-jump conn)))))
 
 (defmacro with-connection ((var host &rest args) &body body)
   `(let ((,var (connect ,host ,@args)))

@@ -110,6 +110,30 @@
         (make-chan :conn conn :local-id 0 :remote-id remote
                    :send-window swin :recv-window *initial-window* :send-max smax)))))
 
+(defun open-direct-tcpip (conn host port &key (originator "127.0.0.1") (originator-port 0))
+  "A channel to HOST:PORT made by the server at the other end of CONN -- a jump host's tunnel to what is
+   behind it (RFC 4254 §7.2, what `ssh -J` and `ssh -L` use).  HOST is the jump host's to resolve, so a
+   name only its network knows works."
+  (let ((w (make-writer)))
+    (w-byte w +msg-channel-open+) (w-string w "direct-tcpip")
+    (w-u32 w 0) (w-u32 w *initial-window*) (w-u32 w *max-packet*)
+    (w-string w host) (w-u32 w port) (w-string w originator) (w-u32 w originator-port)
+    (write-packet conn (writer-bytes w)))
+  (let* ((p (read-payload conn)) (r (make-reader p 1)))
+    (cond ((= (aref p 0) +msg-channel-open-confirmation+)
+           (r-u32 r)
+           (let ((remote (r-u32 r)) (swin (r-u32 r)) (smax (r-u32 r)))
+             (make-chan :conn conn :local-id 0 :remote-id remote
+                        :send-window swin :recv-window *initial-window* :send-max smax)))
+          ((= (aref p 0) +msg-channel-open-failure+)
+           (r-u32 r)
+           (let ((code (r-u32 r)) (desc (r-cstring r)))
+             (ssh-error "the jump host could not reach ~a:~d (~a~@[: ~a~])" host port
+                        (case code (1 "not allowed") (2 "connection failed") (3 "no tunnels")
+                              (4 "out of resources") (t (format nil "reason ~d" code)))
+                        (and (plusp (length desc)) desc))))
+          (t (ssh-protocol-error "unexpected reply ~d to a direct-tcpip open" (aref p 0))))))
+
 (defun chan-request-1 (c request arg what)
   "Send a channel request of type REQUEST carrying one string ARG, want_reply t,
    and await CHANNEL_SUCCESS / CHANNEL_FAILURE."
@@ -140,9 +164,21 @@
         do (if (or (chan-eof c) (chan-closed c))
                (ssh-error "channel: unexpected EOF (have ~d, need ~d)" (chan-avail c) n)
                (chan-await-data c)))
-  (let ((start (chan-in-pos c)))
+  (let* ((start (chan-in-pos c))
+         (out (coerce (subseq (chan-in c) start (+ start n)) '(simple-array (unsigned-byte 8) (*)))))
     (setf (chan-in-pos c) (+ start n))
-    (coerce (subseq (chan-in c) start (+ start n)) '(simple-array (unsigned-byte 8) (*)))))
+    (chan-compact c)
+    out))
+
+(defun chan-compact (c)
+  "Drop what has been read from the front of C's input.  Without this a channel kept every byte it was
+   ever sent: a long download (or a jump host's tunnel) held it all in memory."
+  (when (> (chan-in-pos c) 65536)
+    (sb-thread:with-mutex ((chan-data-lock c))
+      (let* ((in (chan-in c)) (pos (chan-in-pos c)) (rest (- (fill-pointer in) pos)))
+        (replace in in :start2 pos :end2 (fill-pointer in))
+        (setf (fill-pointer in) rest
+              (chan-in-pos c) 0)))))
 
 (defun chan-read-byte (c) (aref (chan-read-exact c 1) 0))
 

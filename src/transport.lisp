@@ -25,6 +25,11 @@
 (defstruct ssh-conn
   socket
   stream
+  ;; A connection through a JUMP HOST has no socket: VIA is a direct-tcpip channel on the jump host's
+  ;; connection, and the bytes go through it.  JUMP is that connection, owned (closed with this one) once
+  ;; this one is up.
+  via
+  jump
   (client-id "" :type string)
   (server-id "" :type string)
   (send-seq 0 :type (unsigned-byte 32))
@@ -54,8 +59,10 @@
                   :buffering :none))))
 
 (defun send-raw (conn bytes)
-  (write-sequence bytes (ssh-conn-stream conn))
-  (force-output (ssh-conn-stream conn)))
+  (if (ssh-conn-via conn)
+      (chan-write (ssh-conn-via conn) bytes)
+      (progn (write-sequence bytes (ssh-conn-stream conn))
+             (force-output (ssh-conn-stream conn)))))
 
 (defvar *mid-packet* nil
   "True while a packet is partly read: its first bytes are in, the rest are not.  Not a SAFE POINT.")
@@ -98,6 +105,11 @@
                (throw 'sftp-rescan nil)))))
 
 (defun read-exact (conn n)
+  ;; through a jump host: the bytes come from the tunnel, whose waits are the jump connection's reads -- and
+  ;; those call *WAIT-HOOK*, and cancel only at a safe point, as any read does (the special variables that
+  ;; say "mid-packet" are bound by this connection's reads as much as by the jump connection's)
+  (when (ssh-conn-via conn)
+    (return-from read-exact (chan-read-exact (ssh-conn-via conn) n)))
   (when *wait-hook* (await-input conn))
   (let* ((buf (make-array n :element-type '(unsigned-byte 8)))
          (got (read-sequence buf (ssh-conn-stream conn))))
