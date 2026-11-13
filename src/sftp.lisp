@@ -18,6 +18,7 @@
 (defconstant +fxp-stat+ 17)     (defconstant +fxp-rename+ 18)
 (defconstant +fxp-status+ 101)  (defconstant +fxp-handle+ 102)
 (defconstant +fxp-data+ 103)    (defconstant +fxp-name+ 104)
+(defconstant +fxp-extended+ 200) (defconstant +fxp-extended-reply+ 201)
 (defconstant +fxp-attrs+ 105)
 ;; open flags
 (defconstant +fxf-read+ 1)   (defconstant +fxf-write+ 2)  (defconstant +fxf-append+ 4)
@@ -565,3 +566,91 @@
 
 (defun sftp-remove (s path)
   (sftp-ok-of s (%path-request s +fxp-remove+ path) "remove"))
+
+;;; ---- a folder and everything in it ----
+
+(defun sftp-tree-contents (s root &key progress)
+  "Everything under ROOT, counted: (values FILES DIRS BYTES), FILES the paths of its files (symlinks among
+   them: a link is removed, not followed), DIRS its folders with their depth below ROOT, (path . depth), ROOT
+   itself (depth 0) first.  PROGRESS is called with (files dirs bytes) as it goes; returning :ABORT cancels."
+  (let ((files '()) (dirs (list (cons root 0))) (bytes 0) (depth (make-hash-table :test 'equal)))
+    (setf (gethash root depth) 0)
+    (sftp-walk s root
+               (lambda (p entries)
+                 (if (keywordp entries)
+                     (progn (when (eq entries :unreadable)
+                              (ssh-error "~a cannot be read, so it cannot be deleted whole" p))
+                            nil)
+                     (prog1
+                         (loop for e in entries
+                               for path = (if (string= p "/") (concatenate 'string "/" (sftp-entry-name e))
+                                              (concatenate 'string p "/" (sftp-entry-name e)))
+                               if (eq (sftp-entry-kind e) :directory)
+                                 do (let ((d (1+ (gethash p depth))))
+                                      (setf (gethash path depth) d)
+                                      (push (cons path d) dirs))
+                                 and collect path
+                               else do (push path files) (incf bytes (or (sftp-entry-size e) 0)))
+                       (%progress (and progress (lambda (a b) (declare (ignore b)) (funcall progress a (length dirs) bytes)))
+                                  (length files) nil)))))
+    (values (nreverse files) (nreverse dirs) bytes)))
+
+(defun sftp-delete-paths (s files dirs &key progress)
+  "Remove FILES (paths), then DIRS ((path . depth), from SFTP-TREE-CONTENTS) deepest first -- *SFTP-WINDOW*
+   requests in flight, a depth at a time for the folders, so a folder is never asked to go before what was in
+   it.  What the server refuses is skipped, not fatal.  PROGRESS is called with (done total) as removals are
+   answered; returning :ABORT stops (what is in flight is still answered).  Returns the refusals, a list of
+   (path . message)."
+  (let* ((total (+ (length files) (length dirs))) (done 0) (failures '()) (queue '()))
+    (labels ((take ()
+               (destructuring-bind (path id what) (first queue)
+                 (handler-case (sftp-ok-of s id what)
+                   (ssh-error (e) (if (search "cancelled" (ssh-error-message e))
+                                      (error e)
+                                      (push (cons path (ssh-error-message e)) failures))))
+                 (pop queue)
+                 (incf done)
+                 (%progress progress done total)))
+             (run (paths type what)
+               (dolist (p paths)
+                 (setf queue (nconc queue (list (list p (%path-request s type p) what))))
+                 (when (>= (length queue) *sftp-window*) (take)))
+               (loop while queue do (take))))
+      (unwind-protect
+           (progn
+             (%progress progress 0 total)
+             (run files +fxp-remove+ "remove")
+             (let ((by-depth (sort (copy-list dirs) #'> :key #'cdr)))
+               (loop while by-depth
+                     do (let ((d (cdr (first by-depth))))
+                          (run (loop while (and by-depth (= (cdr (first by-depth)) d))
+                                     collect (car (pop by-depth)))
+                               +fxp-rmdir+ "rmdir")))))
+        (let ((*wait-hook* nil))
+          (dolist (q queue) (ignore-errors (sftp-response s (second q)))))))
+    (nreverse failures)))
+
+(defun sftp-lstat-many (s paths)
+  "Each of PATHS lstat'ed -- all asked at once, one round trip for the lot -- in order: its attributes, or NIL
+   for one that is not there (or cannot be looked at)."
+  (let ((ids (mapcar (lambda (p) (%path-request s +fxp-lstat+ p)) paths)) (out '()))
+    (unwind-protect
+         (loop while ids
+               do (multiple-value-bind (type r) (sftp-response s (first ids))
+                    (pop ids)
+                    (push (and (= type +fxp-attrs+) (read-attrs r)) out)))
+      (let ((*wait-hook* nil)) (dolist (id ids) (ignore-errors (sftp-response s id)))))
+    (nreverse out)))
+
+(defun sftp-statvfs (s path)
+  "The filesystem PATH is on, by OpenSSH's statvfs@openssh.com extension: a plist of :SIZE :FREE (for the
+   user: what is available to them) :USED, in bytes, and :FILES :FILES-FREE -- or NIL where the server does
+   not have the extension."
+  (multiple-value-bind (type r)
+      (sftp-response s (sftp-request s +fxp-extended+ (lambda (w) (w-string w "statvfs@openssh.com") (w-string w path))))
+    (when (= type +fxp-extended-reply+)
+      (let* ((bsize (r-u64 r)) (frsize (r-u64 r)) (blocks (r-u64 r)) (bfree (r-u64 r)) (bavail (r-u64 r))
+             (files (r-u64 r)) (ffree (r-u64 r)))
+        (declare (ignore bsize))
+        (list :size (* frsize blocks) :free (* frsize bavail) :used (* frsize (- blocks bfree))
+              :files files :files-free ffree)))))
