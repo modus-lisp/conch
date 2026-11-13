@@ -569,10 +569,12 @@
 
 ;;; ---- a folder and everything in it ----
 
-(defun sftp-tree-contents (s root &key progress)
+(defun sftp-tree-contents (s root &key progress sizes stamps)
   "Everything under ROOT, counted: (values FILES DIRS BYTES), FILES the paths of its files (symlinks among
    them: a link is removed, not followed), DIRS its folders with their depth below ROOT, (path . depth), ROOT
-   itself (depth 0) first.  PROGRESS is called with (files dirs bytes) as it goes; returning :ABORT cancels."
+   itself (depth 0) first.  SIZES: each file as (path . size) instead; STAMPS: as (path size mtime), the mtime
+   in seconds since 1970.  PROGRESS is called with (files dirs
+   bytes) as it goes; returning :ABORT cancels."
   (let ((files '()) (dirs (list (cons root 0))) (bytes 0) (depth (make-hash-table :test 'equal)))
     (setf (gethash root depth) 0)
     (sftp-walk s root
@@ -590,7 +592,15 @@
                                       (setf (gethash path depth) d)
                                       (push (cons path d) dirs))
                                  and collect path
-                               else do (push path files) (incf bytes (or (sftp-entry-size e) 0)))
+                               else do (push (cond
+                                              (stamps (list path (if (eq (sftp-entry-kind e) :symlink) nil (or (sftp-entry-size e) 0))
+                                                            (sftp-entry-mtime e)))
+                                              (sizes
+                                                 ;; a symlink's size is the link's own: none, so it is read to its end
+                                                 (cons path (if (eq (sftp-entry-kind e) :symlink) nil (or (sftp-entry-size e) 0))))
+                                              (t path))
+                                             files)
+                                       (incf bytes (or (sftp-entry-size e) 0)))
                        (%progress (and progress (lambda (a b) (declare (ignore b)) (funcall progress a (length dirs) bytes)))
                                   (length files) nil)))))
     (values (nreverse files) (nreverse dirs) bytes)))
@@ -654,3 +664,81 @@
         (declare (ignore bsize))
         (list :size (* frsize blocks) :free (* frsize bavail) :used (* frsize (- blocks bfree))
               :files files :files-free ffree)))))
+
+(defparameter *sftp-small-file* (* 4 32768)
+  "Files up to this size SFTP-GET-MANY fetches together, a batch at a time; larger ones one by one.")
+
+(defun sftp-get-many (s jobs &key progress on-file (batch 16))
+  "Download JOBS, each (remote local size): small files *SFTP-SMALL-FILE* or less BATCH at a time -- their opens
+   sent together, then their reads, then their closes, about three round trips for the batch -- and the rest
+   one by one with SFTP-GET's own window.  A file that cannot be read is skipped, not fatal.  PROGRESS is
+   called with (files-done bytes-done) as they finish; returning :ABORT stops (what is in flight is drained, a
+   file part way is deleted).  ON-FILE is called with each job as its file is in, whole.  Returns the failures, a
+   list of (remote . message)."
+  (let ((done 0) (bytes 0) (failures '()))
+    (labels ((tell () (%progress (and progress (lambda (a b) (declare (ignore b)) (funcall progress a bytes)))
+                                 done nil))
+             (failed (remote e) (push (cons remote (if (typep e 'ssh-error) (ssh-error-message e) (princ-to-string e)))
+                                      failures))
+             (cancel-p (e) (and (typep e 'ssh-error) (search "cancelled" (ssh-error-message e))))
+             (small-batch (jobs)
+               (let ((opens (mapcar (lambda (j) (list j (%open-request s (first j) +fxf-read+))) jobs))
+                     (open '()) (reads '()) (closes '()))
+                 (unwind-protect
+                      (progn
+                        ;; handles
+                        (loop while opens
+                              do (destructuring-bind (j id) (first opens)
+                                   (let ((h (handler-case (sftp-handle-of s id "open")
+                                              (ssh-error (e) (if (cancel-p e) (error e) (progn (failed (first j) e) nil))))))
+                                     (pop opens)
+                                     (when h (push (list j h) open)))))
+                        (setf open (nreverse open))
+                        ;; every chunk of every file, asked at once
+                        (setf reads (loop for (j h) in open
+                                          collect (list j h (loop for at from 0 below (max 1 (third j)) by *sftp-chunk*
+                                                                  collect (%read-request s h at *sftp-chunk*)))))
+                        (loop while reads
+                              do (destructuring-bind (j h ids) (first reads)
+                                   (declare (ignore h))
+                                   (let ((out (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0))
+                                         (ok t))
+                                     (loop while ids
+                                           do (let ((data (handler-case (sftp-data-of s (first ids))
+                                                            (ssh-error (e) (if (cancel-p e) (error e)
+                                                                               (progn (when ok (failed (first j) e)) (setf ok nil) nil))))))
+                                                (pop ids) (setf (third (first reads)) ids)
+                                                (when data (loop for b across data do (vector-push-extend b out)))))
+                                     (pop reads)
+                                     (when ok
+                                       (with-open-file (f (second j) :direction :output :element-type '(unsigned-byte 8)
+                                                                     :if-exists :supersede :if-does-not-exist :create)
+                                         (write-sequence out f))
+                                       (incf bytes (length out))
+                                       (when on-file (funcall on-file j)))
+                                     (incf done)
+                                     (tell)))))
+                   (let ((*wait-hook* nil))
+                     (dolist (o opens) (ignore-errors (let ((h (sftp-handle-of s (second o) "open"))) (push (list (first o) h) open))))
+                     (dolist (r reads) (dolist (id (third r)) (ignore-errors (sftp-response s id))))
+                     (setf closes (mapcar (lambda (o) (%handle-request s +fxp-close+ (second o))) open))
+                     (dolist (id closes) (ignore-errors (sftp-response s id))))))))
+      (let* ((small-p (lambda (j) (and (third j) (<= (third j) *sftp-small-file*))))  ; no size: read whole
+             (small (remove-if-not small-p jobs))
+             (large (remove-if small-p jobs)))
+        (loop while small
+              do (small-batch (loop repeat batch while small collect (pop small))))
+        (dolist (j large)
+          (let ((before bytes))
+            (handler-case
+                (progn
+                  (sftp-get s (first j) (second j)
+                            :progress (lambda (got total)
+                                        (declare (ignore total))
+                                        (setf bytes (+ before got))
+                                        (and progress (funcall progress done bytes))))
+                  (when on-file (funcall on-file j)))
+              (ssh-error (e) (if (cancel-p e) (error e) (failed (first j) e)))))
+          (incf done)
+          (tell))))
+    (nreverse failures)))
