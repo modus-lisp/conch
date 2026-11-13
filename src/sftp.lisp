@@ -447,7 +447,8 @@
    first.  FN is called with (PATH ENTRIES) for each batch of a folder's entries as it comes (SFTP-ENTRY
    structs, \".\" and \"..\" left out), and returns the paths of the folders among them to go into (a symlink to
    a folder: the caller's choice); with (PATH :UNREADABLE) for a folder that cannot be opened or read; and
-   with (PATH :DONE) once a folder is finished.  For a disk-usage scan: a deep tree is listed with many round
+   with (PATH :DONE) once a folder is finished -- which may return folders to go into as well (a caller
+   that must see all of a folder before it decides: its .gitignore, say, may come in its last batch).  For a disk-usage scan: a deep tree is listed with many round
    trips overlapping, not one folder after another.  Interrupted (a cancel), it reads what it had in flight and
    closes what it opened."
   (let ((pending (list root))
@@ -470,7 +471,7 @@
                  (enqueue (list :close p (%handle-request s +fxp-close+ (first st))))
                  (remhash p dirs)
                  (decf open)
-                 (funcall fn p :done))))
+                 (dolist (sub (funcall fn p :done)) (push sub pending)))))
       (unwind-protect
            (progn
              (open-next)
@@ -487,7 +488,7 @@
                                    (dotimes (i reads) (ask p st)))
                                  (progn (decf open)
                                         (funcall fn p :unreadable)
-                                        (funcall fn p :done)))))
+                                        (dolist (sub (funcall fn p :done)) (push sub pending))))))
                           (:read
                            (let ((batch (handler-case (sftp-names-of s id :attrs t)
                                           (ssh-error (e) (if (cancelled-p e) (error e) :error))))
