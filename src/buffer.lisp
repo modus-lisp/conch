@@ -21,25 +21,43 @@
     (vector (coerce x '(simple-array (unsigned-byte 8) (*))))))
 
 ;;; ---- writer ----------------------------------------------------------------
-(defun make-writer ()
-  (make-array 64 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0))
+;;; A simple byte vector and a fill position, grown by doubling, and bytes copied in with REPLACE: an upload's
+;;; every 32 KB chunk passes through a writer three times (the SFTP write, the channel's data, the packet), and
+;;; a byte at a time through VECTOR-PUSH-EXTEND on an adjustable array was a third of an upload's time on modus.
+(defstruct (writer (:constructor make-writer ()))
+  (buf (make-array 64 :element-type '(unsigned-byte 8)) :type u8v)
+  (fill 0 :type fixnum))
+
+(defun w-room (w n)
+  "Room in W for N more bytes; returns the position they go at."
+  (let* ((at (writer-fill w)) (need (+ at n)) (buf (writer-buf w)))
+    (when (> need (length buf))
+      (let ((new (make-array (max need (* 2 (length buf))) :element-type '(unsigned-byte 8))))
+        (replace new buf :end2 at)
+        (setf (writer-buf w) new)))
+    (setf (writer-fill w) need)
+    at))
 
 (defun writer-bytes (w)
   "The accumulated content as a fresh simple (unsigned-byte 8) vector."
-  (coerce w '(simple-array (unsigned-byte 8) (*))))
+  (subseq (writer-buf w) 0 (writer-fill w)))
 
-(defun w-byte (w b) (vector-push-extend (logand b #xff) w) w)
+(defun w-byte (w b) (let ((at (w-room w 1))) (setf (aref (writer-buf w) at) (logand b #xff))) w)
 
 (defun w-raw (w bytes)
-  (loop for x across bytes do (vector-push-extend x w)) w)
+  (let* ((b (to-u8v bytes)) (at (w-room w (length b))))   ; room first: it may replace the buffer
+    (replace (writer-buf w) b :start1 at))
+  w)
 
 (defun w-u32 (w n)
-  (dotimes (i 4 w) (vector-push-extend (logand (ash n (* -8 (- 3 i))) #xff) w)))
+  (let ((at (w-room w 4)) (buf (writer-buf w)))
+    (dotimes (i 4 w) (setf (aref buf (+ at i)) (logand (ash n (* -8 (- 3 i))) #xff)))))
 
 (defun w-u64 (w n)
-  (dotimes (i 8 w) (vector-push-extend (logand (ash n (* -8 (- 7 i))) #xff) w)))
+  (let ((at (w-room w 8)) (buf (writer-buf w)))
+    (dotimes (i 8 w) (setf (aref buf (+ at i)) (logand (ash n (* -8 (- 7 i))) #xff)))))
 
-(defun w-bool (w x) (vector-push-extend (if x 1 0) w) w)
+(defun w-bool (w x) (w-byte w (if x 1 0)))
 
 (defun w-string (w x)
   "Write a length-prefixed string.  X may be a byte vector or a Lisp string."

@@ -21,9 +21,12 @@
 (defstruct chan
   conn local-id remote-id
   (send-window 0) (recv-window 0) (send-max 32768)
-  (in (make-array 4096 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0))
-  (in-pos 0)
-  (err (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0))
+  ;; what has come and not been read: IN[IN-POS, IN-FILL) -- a simple vector and two indices, not an
+  ;; adjustable one, so every copy in and out is a REPLACE between simple vectors (on modus a SUBSEQ of an
+  ;; adjustable vector goes element by element: 104 MB/s, a download's every byte)
+  (in (make-array 4096 :element-type '(unsigned-byte 8)))
+  (in-pos 0) (in-fill 0)
+  (err (make-writer))                   ; extended data (stderr), as it comes
   (eof nil) (closed nil) (close-sent nil) (exit nil)
   ;; Server side.  PTY is the client's terminal, as described by its pty-req and
   ;; kept current by window-change — a full-screen TUI needs the size and needs
@@ -48,7 +51,7 @@
   ;; polling for a size it has no other way to learn.
   (on-resize nil))
 
-(defun chan-avail (c) (- (fill-pointer (chan-in c)) (chan-in-pos c)))
+(defun chan-avail (c) (- (chan-in-fill c) (chan-in-pos c)))
 
 ;;; ---- packet dispatch -------------------------------------------------------
 (defun chan-maybe-adjust-window (c)
@@ -58,6 +61,16 @@
       (write-packet (chan-conn c) (writer-bytes w))
       (incf (chan-recv-window c) inc))))
 
+(defun %chan-append (c bytes)
+  "BYTES onto the end of C's input, the buffer doubled when they do not fit."
+  (let* ((at (chan-in-fill c)) (need (+ at (length bytes))) (in (chan-in c)))
+    (when (> need (length in))
+      (let ((new (make-array (max need (* 2 (length in))) :element-type '(unsigned-byte 8))))
+        (replace new in :end2 at)
+        (setf (chan-in c) new)))
+    (replace (chan-in c) bytes :start1 at)
+    (setf (chan-in-fill c) need)))
+
 (defun chan-process (c p)
   (let ((msg (aref p 0)) (r (make-reader p 1)))
     (cond
@@ -65,13 +78,13 @@
        (r-u32 r)
        (let ((d (r-string r)))
          (sb-thread:with-mutex ((chan-data-lock c))
-           (loop for b across d do (vector-push-extend b (chan-in c)))
+           (%chan-append c d)
            (sb-thread:condition-broadcast (chan-data-cv c)))
          (decf (chan-recv-window c) (length d))
          (chan-maybe-adjust-window c)))
       ((= msg +msg-channel-extended-data+)
        (r-u32 r) (r-u32 r)
-       (loop for b across (r-string r) do (vector-push-extend b (chan-err c))))
+       (w-raw (chan-err c) (r-string r)))
       ((= msg +msg-channel-window-adjust+)
        (r-u32 r)
        (let ((inc (r-u32 r)))
@@ -185,7 +198,7 @@
                (ssh-error "channel: unexpected EOF (have ~d, need ~d)" (chan-avail c) n)
                (chan-await-data c)))
   (let* ((start (chan-in-pos c))
-         (out (coerce (subseq (chan-in c) start (+ start n)) '(simple-array (unsigned-byte 8) (*)))))
+         (out (replace (make-array n :element-type '(unsigned-byte 8)) (chan-in c) :start2 start)))
     (setf (chan-in-pos c) (+ start n))
     (chan-compact c)
     out))
@@ -195,9 +208,9 @@
    ever sent: a long download (or a jump host's tunnel) held it all in memory."
   (when (> (chan-in-pos c) 65536)
     (sb-thread:with-mutex ((chan-data-lock c))
-      (let* ((in (chan-in c)) (pos (chan-in-pos c)) (rest (- (fill-pointer in) pos)))
-        (replace in in :start2 pos :end2 (fill-pointer in))
-        (setf (fill-pointer in) rest
+      (let* ((in (chan-in c)) (pos (chan-in-pos c)) (rest (- (chan-in-fill c) pos)))
+        (replace in in :start2 pos :end2 (chan-in-fill c))
+        (setf (chan-in-fill c) rest
               (chan-in-pos c) 0)))))
 
 (defun chan-read-byte (c) (aref (chan-read-exact c 1) 0))
@@ -211,14 +224,12 @@
 (defun chan-read-all (c)
   "Read all remaining channel data until EOF; return a fresh byte vector.  Used
    by callers (e.g. git-over-SSH) that consume a stream of unknown length."
-  (let ((out (make-array 4096 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0)))
+  (let ((out (make-writer)))
     (loop until (and (zerop (chan-avail c)) (chan-eof c)) do
       (if (zerop (chan-avail c))
           (chan-await-data c)
-          (let ((n (chan-avail c)) (start (chan-in-pos c)))
-            (dotimes (i n) (vector-push-extend (aref (chan-in c) (+ start i)) out))
-            (setf (chan-in-pos c) (+ start n)))))
-    (coerce out '(simple-array (unsigned-byte 8) (*)))))
+          (w-raw out (chan-read-exact c (chan-avail c)))))
+    (writer-bytes out)))
 
 (defun chan-await-window (c)
   "Block until the peer has granted send window."
@@ -269,7 +280,7 @@
     (loop until (chan-closed c) do (chan-pump c))
     (chan-close c)
     (values (coerce (subseq (chan-in c) (chan-in-pos c)) '(simple-array (unsigned-byte 8) (*)))
-            (coerce (chan-err c) '(simple-array (unsigned-byte 8) (*)))
+            (writer-bytes (chan-err c))
             (chan-exit c))))
 
 (defun exec-lines (conn command fn)
