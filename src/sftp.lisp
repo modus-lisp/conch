@@ -37,7 +37,11 @@
 ;;;     POINT (AT-SAFE-POINT-P): a tap is answered while a preload or a transfer is still in flight.
 
 (defparameter *sftp-chunk* 32768 "Bytes a read or a write asks for.")
-(defparameter *sftp-window* 16 "Reads (or writes) a transfer keeps in flight.")
+(defparameter *sftp-window* 128
+  "Reads (or writes) a transfer keeps in flight: a transfer moves at most this many chunks a round trip, so 16
+   (512 KB) held a 50 ms link to 9 MB/s and a 400 ms one to 1.2.  At 400 ms, 64 made it 3.2 both ways and 128
+   made downloads 4.3; uploads stay at 3.2 past 64, where OpenSSH's own window (2 MB a channel) stops them --
+   the writes past it wait in the channel, harmless.")
 
 (defstruct sftp chan (idc 0) version
   (pending (make-hash-table))       ; responses read on another request's way: id -> (type . payload)

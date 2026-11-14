@@ -15,7 +15,10 @@
 (defconstant +msg-channel-success+ 99)
 (defconstant +msg-channel-failure+ 100)
 
-(defparameter *initial-window* (* 2 1024 1024))
+(defparameter *initial-window* (* 8 1024 1024)
+  "What a channel lets its peer send ahead.  More than SFTP's reads in flight (64 x 32 KB = 2 MB): at 2 MB the two
+   were the same, and every top-up of the window cost a round trip -- a download over a 50 ms link stopped at
+   17.6 MB/s where uploads went on to 32.")
 (defparameter *max-packet* 32768)
 
 (defstruct chan
