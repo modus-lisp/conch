@@ -44,6 +44,7 @@
    the writes past it wait in the channel, harmless.")
 
 (defstruct sftp chan (idc 0) version
+  (out (make-writer))               ; where each request is built: kept (a message is sent whole, then done with)
   (pending (make-hash-table))       ; responses read on another request's way: id -> (type . payload)
   (asked (make-hash-table)))        ; ids sent and not yet answered to their request
 
@@ -72,11 +73,16 @@
 
 (defun sftp-request (s type write-body)
   "Send a request of TYPE -- its id, then what WRITE-BODY (a function of a writer) writes -- and return
-   its id, without waiting for the response."
-  (let ((id (sftp-next-id s)) (w (make-writer)))
-    (w-u32 w id)
+   its id, without waiting for the response.  Built whole -- length, type, id, body -- in S's own writer,
+   and sent from there."
+  (let ((id (sftp-next-id s)) (w (sftp-out s)))
+    (setf (writer-fill w) 0)
+    (w-u32 w 0) (w-byte w type) (w-u32 w id)                 ; the length, once known
     (when write-body (funcall write-body w))
-    (sftp-send s type (writer-bytes w))
+    (let ((n (- (writer-fill w) 4)) (buf (writer-buf w)))
+      (dotimes (i 4) (setf (aref buf i) (ldb (byte 8 (* 8 (- 3 i))) n))))
+    (let ((*mid-sftp* t))                          ; a message is written whole, or not at all
+      (chan-write (sftp-chan s) (writer-buf w) (writer-fill w)))
     (setf (gethash id (sftp-asked s)) t)
     id))
 
@@ -183,6 +189,38 @@
              (if (= code +fx-eof+) nil (ssh-error "sftp read failed (code ~d): ~a" code (r-cstring r)))))
           (t (ssh-error "sftp: expected DATA/STATUS, got ~d" type)))))
 
+(defun %sftp-data-into (s id sink)
+  "A READ's response given to SINK, a function of (BUFFER START END): its length, or NIL at end of file.  When
+   it is the next message in the channel, its bytes go to SINK from where they arrived (SFTP-DATA-OF would copy
+   them twice first); anything else -- set aside already, another's, a status -- goes the usual way."
+  (let ((c (sftp-chan s)) (pending (sftp-pending s)))
+    (flet ((usual () (let ((d (sftp-data-of s id))) (when d (funcall sink d 0 (length d)) (length d)))))
+      (loop
+        (when (nth-value 1 (gethash id pending)) (return (usual)))
+        (let ((avail (chan-avail c)))
+          (if (and (>= avail 4) (>= avail (+ 4 (u32-at (chan-in c) (chan-in-pos c)))))
+              ;; a whole message: length, type, id, then (DATA) the bytes' length and the bytes
+              (let* ((in (chan-in c)) (at (chan-in-pos c)) (len (u32-at in at)))
+                (unless (and (>= len 9) (= (aref in (+ at 4)) +fxp-data+) (= (u32-at in (+ at 5)) id))
+                  (return (usual)))
+                (let ((n (u32-at in (+ at 9))))
+                  (when (> (+ 9 n) len) (ssh-protocol-error "sftp: DATA longer than its message"))
+                  ;; taken off the channel first: SINK may wait on another connection, whose hook may read here
+                  (setf (chan-in-pos c) (+ at 4 len))
+                  (remhash id (sftp-asked s))
+                  (funcall sink in (+ at 13) (+ at 13 n))
+                  (chan-compact c)
+                  (return n)))
+              ;; more to come: wait as SFTP-RECV waits (a safe point until a message has begun), and look
+              ;; again -- a hook's request may have read this response meanwhile (then it is set aside)
+              (progn
+                (when (or (chan-eof c) (chan-closed c))
+                  (ssh-error "channel: unexpected EOF (have ~d)" avail))
+                (catch 'sftp-rescan
+                  (let ((*rescan* (lambda () (nth-value 1 (gethash id pending))))
+                        (*mid-sftp* (or *mid-sftp* (plusp avail))))
+                    (chan-await-data c))))))))))
+
 (defun sftp-names-of (s id &key attrs)
   "A READDIR's response: a batch of names -- with ATTRS, SFTP-ENTRY structs -- or NIL at its end."
   (multiple-value-bind (type r) (sftp-response s id)
@@ -210,8 +248,11 @@
   (sftp-request s type (lambda (w) (w-string w path))))
 (defun %read-request (s handle offset length)
   (sftp-request s +fxp-read+ (lambda (w) (w-string w handle) (w-u64 w offset) (w-u32 w length))))
-(defun %write-request (s handle offset data)
-  (sftp-request s +fxp-write+ (lambda (w) (w-string w handle) (w-u64 w offset) (w-string w data))))
+(defun %write-request (s handle offset data &optional (end (length data)) (start 0))
+  (sftp-request s +fxp-write+ (lambda (w)
+                                (w-string w handle) (w-u64 w offset) (w-u32 w (- end start))
+                                (let ((at (w-room w (- end start))))
+                                  (replace (writer-buf w) data :start1 at :start2 start :end2 end)))))
 
 (defun sftp-open-file (s path flags &optional mode)
   (sftp-handle-of s (%open-request s path flags mode) "open"))
@@ -236,6 +277,18 @@
   "Download REMOTE-PATH to LOCAL-PATH, straight into the file, *SFTP-WINDOW* reads in flight.  PROGRESS,
    when given, is called with the bytes so far and the file's size (NIL if the server does not say) as
    they come; returning :ABORT cancels -- the partial file is deleted.  Returns bytes transferred."
+  (let ((ok nil))
+    (unwind-protect
+         (with-open-file (out local-path :element-type '(unsigned-byte 8) :direction :output
+                                         :if-exists :supersede :if-does-not-exist :create)
+           (prog1 (sftp-map-file s remote-path (lambda (buf start end) (write-sequence buf out :start start :end end))
+                                 :progress progress)
+             (setf ok t)))
+      (unless ok (ignore-errors (delete-file local-path))))))
+
+(defun sftp-map-file (s remote-path fn &key progress)
+  "Call FN with (BUFFER START END) for each piece of REMOTE-PATH, in order -- where it arrived, good only until
+   FN returns -- *SFTP-WINDOW* reads in flight.  PROGRESS as for SFTP-GET; its :ABORT cancels.  The total."
   ;; the size and the open, asked together; both answered inside the protection below, so a cancel while
   ;; waiting for either still leaves nothing unread and no handle open
   (let* ((stat-id (%path-request s +fxp-stat+ remote-path))
@@ -243,7 +296,7 @@
          (total nil) (handle nil)
          (queue '())                ; requests in flight, oldest first: (offset length id)
          (next 0)                   ; the next offset to ask for
-         (done 0) (eof nil) (ok nil))
+         (done 0) (eof nil))
     (labels ((ask (offset length)
                (list offset length (%read-request s handle offset length)))
              (fill-window ()
@@ -257,32 +310,30 @@
              (setf total (multiple-value-bind (type r) (multiple-value-prog1 (sftp-response s stat-id) (setf stat-id nil))
                            (and (= type +fxp-attrs+) (getf (read-attrs r) :size))))
              (setf handle (prog1 (sftp-handle-of s open-id "open") (setf open-id nil)))
-             (with-open-file (out local-path :element-type '(unsigned-byte 8) :direction :output
-                                             :if-exists :supersede :if-does-not-exist :create)
-               (%progress progress 0 total)
-               (fill-window)
-               (loop while queue
-                     do (destructuring-bind (offset length id) (first queue)
-                          ;; off the queue only once answered: a cancel while waiting leaves it there, to drain
-                          (let ((data (prog1 (sftp-data-of s id) (pop queue))))
-                            (cond ((null data) (setf eof t))
-                                  (t (write-sequence data out)     ; responses are taken in order
-                                     (incf done (length data))
-                                     (when (< (length data) length)
-                                       ;; a short read: the rest of that chunk, asked for at once and
-                                       ;; taken next, so the file is still written in order
-                                       (push (ask (+ offset (length data)) (- length (length data))) queue))
-                                     (%progress progress done total)))
-                            (fill-window)))))
-             (setf ok t))
+             (%progress progress 0 total)
+             (fill-window)
+             (loop while queue
+                   do (destructuring-bind (offset length id) (first queue)
+                        ;; off the queue once answered (a cancel while waiting leaves it there, to drain) --
+                        ;; before FN, which is given it: what FN signals leaves nothing to drain for it
+                        (let ((got (%sftp-data-into s id (lambda (buf start end)
+                                                           (pop queue)
+                                                           (funcall fn buf start end)))))
+                          (cond ((null got) (pop queue) (setf eof t))   ; EOF: not given to FN
+                                (t (incf done got)
+                                   (when (< got length)
+                                     ;; a short read: the rest of that chunk, asked for at once and taken
+                                     ;; next, so the pieces still come in order
+                                     (push (ask (+ offset got) (- length got)) queue))
+                                   (%progress progress done total)))
+                          (fill-window)))))
         ;; whatever is still in flight (a cancel, an error) is read and dropped, so nothing is left behind --
         ;; without the hook, whose cancel would cut the clean-up short too
         (let ((*wait-hook* nil))
           (when stat-id (ignore-errors (sftp-response s stat-id)))
           (when open-id (setf handle (ignore-errors (sftp-handle-of s open-id "open"))))
           (dolist (q queue) (ignore-errors (sftp-response s (third q))))
-          (when handle (ignore-errors (sftp-close s handle))))
-        (unless ok (ignore-errors (delete-file local-path)))))
+          (when handle (ignore-errors (sftp-close s handle))))))
     done))
 
 (defun sftp-read-range (s remote-path offset length)
@@ -346,7 +397,8 @@
     (let* ((len (file-length in))
            (open-id (%open-request s remote-path (logior +fxf-write+ +fxf-creat+ +fxf-trunc+) #o644))
            (handle nil)
-           (queue '()) (off 0) (acked 0))
+           (queue '()) (off 0) (acked 0)
+           (buf (make-array *sftp-chunk* :element-type '(unsigned-byte 8))))
       (flet ((take ()
                (destructuring-bind (n id) (first queue)
                  (sftp-ok-of s id "write")
@@ -358,12 +410,9 @@
                (setf handle (prog1 (sftp-handle-of s open-id "open") (setf open-id nil)))
                (%progress progress 0 len)
                (loop
-                 (let* ((buf (make-array *sftp-chunk* :element-type '(unsigned-byte 8)))
-                        (n (read-sequence buf in)))
+                 (let ((n (read-sequence buf in)))   ; one buffer: each chunk is copied into its request at once
                    (when (zerop n) (return))
-                   (setf queue (nconc queue (list (list n (%write-request s handle off (if (= n (length buf))
-                                                                                            buf
-                                                                                            (subseq buf 0 n)))))))
+                   (setf queue (nconc queue (list (list n (%write-request s handle off buf n)))))
                    (incf off n)
                    (when (>= (length queue) *sftp-window*) (take))))
                (loop while queue do (take)))
@@ -372,6 +421,56 @@
             (dolist (q queue) (ignore-errors (sftp-response s (second q))))
             (when handle (ignore-errors (sftp-close s handle)))))
         acked))))
+
+;;; A file written a piece at a time, from wherever the bytes come (another server, say): *SFTP-WINDOW*
+;;; writes in flight, as SFTP-PUT keeps them.
+(defstruct (sftp-writer (:constructor %make-sftp-writer (sftp handle)))
+  sftp handle
+  (queue '())            ; writes in flight, oldest first: (bytes id)
+  (offset 0) (acked 0))
+
+(defun sftp-open-write (s path)
+  "PATH opened for writing, made or emptied: a writer for SFTP-WRITE, then SFTP-FINISH-WRITE (or, given up,
+   SFTP-ABANDON-WRITE)."
+  (%make-sftp-writer s (sftp-handle-of s (%open-request s path (logior +fxf-write+ +fxf-creat+ +fxf-trunc+) #o644)
+                                       "open")))
+
+(defun %writer-take (w)
+  (destructuring-bind (n id) (first (sftp-writer-queue w))
+    (sftp-ok-of (sftp-writer-sftp w) id "write")
+    (pop (sftp-writer-queue w))
+    (incf (sftp-writer-acked w) n)))
+
+(defun sftp-write (w data &key (start 0) (end (length data)))
+  "DATA[START,END) written next (copied into its requests at once: DATA may be reused when this returns).  The
+   bytes acknowledged so far."
+  (let ((s (sftp-writer-sftp w)))
+    (loop for at from start below end by *sftp-chunk*
+          do (let ((stop (min end (+ at *sftp-chunk*))))
+               (setf (sftp-writer-queue w)
+                     (nconc (sftp-writer-queue w)
+                            (list (list (- stop at)
+                                        (%write-request s (sftp-writer-handle w) (sftp-writer-offset w) data stop at)))))
+               (incf (sftp-writer-offset w) (- stop at))
+               (when (>= (length (sftp-writer-queue w)) *sftp-window*) (%writer-take w))))
+    (sftp-writer-acked w)))
+
+(defun sftp-finish-write (w)
+  "Every write acknowledged, and the file closed (a write's close can fail: it says so).  The bytes written."
+  (loop while (sftp-writer-queue w) do (%writer-take w))
+  (let ((h (sftp-writer-handle w)))
+    (setf (sftp-writer-handle w) nil)
+    (when h (sftp-close (sftp-writer-sftp w) h)))
+  (sftp-writer-acked w))
+
+(defun sftp-abandon-write (w)
+  "Given up (a cancel, an error): what is in flight read and dropped, the file closed as it is."
+  (let ((*wait-hook* nil) (s (sftp-writer-sftp w)))
+    (dolist (q (sftp-writer-queue w)) (ignore-errors (sftp-response s (second q))))
+    (setf (sftp-writer-queue w) '())
+    (let ((h (sftp-writer-handle w)))
+      (setf (sftp-writer-handle w) nil)
+      (when h (ignore-errors (sftp-close s h))))))
 
 (defparameter *sftp-readdir-window* 3 "READDIRs a listing keeps in flight (each answers the next batch).")
 

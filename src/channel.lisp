@@ -64,27 +64,31 @@
       (write-packet (chan-conn c) (writer-bytes w))
       (incf (chan-recv-window c) inc))))
 
-(defun %chan-append (c bytes)
-  "BYTES onto the end of C's input, the buffer doubled when they do not fit."
-  (let* ((at (chan-in-fill c)) (need (+ at (length bytes))) (in (chan-in c)))
+(defun %chan-append (c bytes &optional (start 0) (end (length bytes)))
+  "BYTES[START,END) onto the end of C's input, the buffer doubled when they do not fit."
+  (let* ((at (chan-in-fill c)) (need (+ at (- end start))) (in (chan-in c)))
     (when (> need (length in))
       (let ((new (make-array (max need (* 2 (length in))) :element-type '(unsigned-byte 8))))
         (replace new in :end2 at)
         (setf (chan-in c) new)))
-    (replace (chan-in c) bytes :start1 at)
+    (replace (chan-in c) bytes :start1 at :start2 start :end2 end)
     (setf (chan-in-fill c) need)))
+
+(defun %chan-data (c buf start end)
+  "A CHANNEL_DATA message, BUF[START,END), for C: its data onto C's input from where it is, not copied out
+   first.  Recipient at START+1, the data's length at START+5, the data from START+9."
+  (let ((n (u32-at buf (+ start 5))))
+    (when (> (+ start 9 n) end) (ssh-protocol-error "channel data longer than its packet"))
+    (sb-thread:with-mutex ((chan-data-lock c))
+      (%chan-append c buf (+ start 9) (+ start 9 n))
+      (sb-thread:condition-broadcast (chan-data-cv c)))
+    (decf (chan-recv-window c) n)
+    (chan-maybe-adjust-window c)))
 
 (defun chan-process (c p)
   (let ((msg (aref p 0)) (r (make-reader p 1)))
     (cond
-      ((= msg +msg-channel-data+)
-       (r-u32 r)
-       (let ((d (r-string r)))
-         (sb-thread:with-mutex ((chan-data-lock c))
-           (%chan-append c d)
-           (sb-thread:condition-broadcast (chan-data-cv c)))
-         (decf (chan-recv-window c) (length d))
-         (chan-maybe-adjust-window c)))
+      ((= msg +msg-channel-data+) (%chan-data c p 0 (length p)))
       ((= msg +msg-channel-extended-data+)
        (r-u32 r) (r-u32 r)
        (w-raw (chan-err c) (r-string r)))
@@ -119,15 +123,26 @@
 
 (defun %read-for (conn id)
   "The next message for the channel whose local id is ID (or not for a channel at all), messages for the
-   other channels handed to them on the way."
+   other channels handed to them on the way -- or NIL once data for ID has been put in its input.  Data, the
+   bulk of what comes, goes from where the packet was decrypted straight into its channel's input: a
+   download's packets are not copied out first."
   (loop
-    (let ((p (read-payload conn)))
-      (if (and (%chan-msg-p (aref p 0)) (/= (%recipient p) id))
-          (let ((other (gethash (%recipient p) (ssh-conn-chans conn))))
-            (when other (chan-process other p)))       ; one already gone: dropped
-          (return p)))))
+    (multiple-value-bind (b s e) (read-packet-in-place conn)
+      (let ((msg (aref b s)))
+        (if (and (= msg +msg-channel-data+) (>= (- e s) 9))
+            (let* ((to (u32-at b (+ s 1))) (c (gethash to (ssh-conn-chans conn))))
+              (when c (%chan-data c b s e))           ; one already gone (or not open yet): dropped
+              (when (and c (= to id)) (return nil)))
+            (let ((p (subseq b s e)))
+              (unless (housekeeping conn p)
+                (if (and (%chan-msg-p msg) (/= (%recipient p) id))
+                    (let ((other (gethash (%recipient p) (ssh-conn-chans conn))))
+                      (when other (chan-process other p)))
+                    (return p)))))))))
 
-(defun chan-pump (c) (chan-process c (%read-for (chan-conn c) (chan-local-id c))))
+(defun chan-pump (c)
+  (let ((p (%read-for (chan-conn c) (chan-local-id c))))
+    (when p (chan-process c p))))
 
 ;;; ---- open / exec -----------------------------------------------------------
 (defun %open-channel (conn type write-extra on-failure)
@@ -177,8 +192,9 @@
     (w-byte w +msg-channel-request+) (w-u32 w (chan-remote-id c))
     (w-string w request) (w-bool w t) (w-string w arg)
     (write-packet (chan-conn c) (writer-bytes w)))
-  (loop for p = (%read-for (chan-conn c) (chan-local-id c)) for msg = (aref p 0)
-        do (cond ((= msg +msg-channel-success+) (return t))
+  (loop for p = (%read-for (chan-conn c) (chan-local-id c)) for msg = (and p (aref p 0))
+        do (cond ((null p))                                      ; its data: in its input
+                 ((= msg +msg-channel-success+) (return t))
                  ((= msg +msg-channel-failure+) (ssh-error "~a request refused by server" what))
                  (t (chan-process c p)))))
 
@@ -200,11 +216,19 @@
         do (if (or (chan-eof c) (chan-closed c))
                (ssh-error "channel: unexpected EOF (have ~d, need ~d)" (chan-avail c) n)
                (chan-await-data c)))
-  (let* ((start (chan-in-pos c))
-         (out (replace (make-array n :element-type '(unsigned-byte 8)) (chan-in c) :start2 start)))
-    (setf (chan-in-pos c) (+ start n))
+  (chan-read-into c (make-array n :element-type '(unsigned-byte 8)) 0 n))
+
+(defun chan-read-into (c buf start end)
+  "BUF[START,END) filled with C's data (blocking); error on premature EOF.  Returns BUF."
+  (let ((n (- end start)))
+    (loop while (< (chan-avail c) n)
+          do (if (or (chan-eof c) (chan-closed c))
+                 (ssh-error "channel: unexpected EOF (have ~d, need ~d)" (chan-avail c) n)
+                 (chan-await-data c)))
+    (replace buf (chan-in c) :start1 start :end1 end :start2 (chan-in-pos c))
+    (incf (chan-in-pos c) n)
     (chan-compact c)
-    out))
+    buf))
 
 (defun chan-compact (c)
   "Drop what has been read from the front of C's input.  Without this a channel kept every byte it was
@@ -243,16 +267,22 @@
                                            :timeout 30)))
       (loop while (<= (chan-send-window c) 0) do (chan-pump c))))
 
-(defun chan-write (c bytes)
-  (let ((bytes (to-u8v bytes)) (pos 0))
-    (loop while (< pos (length bytes)) do
+(defun chan-write (c bytes &optional end)
+  "BYTES[0,END) sent on C, as the peer's window allows.  Each packet's payload is built in the connection's
+   own buffer (under its SEND-LOCK, which WRITE-PACKET takes too), not a fresh vector a packet."
+  (let* ((bytes (to-u8v bytes)) (end (or end (length bytes))) (pos 0) (conn (chan-conn c)))
+    (loop while (< pos end) do
       (chan-await-window c)
       (when (chan-closed c) (return))
-      (let* ((chunk (min (- (length bytes) pos) (chan-send-window c) (chan-send-max c)))
-             (w (make-writer)))
-        (w-byte w +msg-channel-data+) (w-u32 w (chan-remote-id c))
-        (w-string w (subseq bytes pos (+ pos chunk)))
-        (write-packet (chan-conn c) (writer-bytes w))
+      (let ((chunk (min (- end pos) (chan-send-window c) (chan-send-max c))))
+        (sb-thread:with-recursive-lock ((ssh-conn-send-lock conn))
+          (let ((p (%conn-room conn :data (+ 9 chunk))) (id (chan-remote-id c)))
+            (setf (aref p 0) +msg-channel-data+)
+            (dotimes (i 4)
+              (setf (aref p (+ 1 i)) (ldb (byte 8 (* 8 (- 3 i))) id)
+                    (aref p (+ 5 i)) (ldb (byte 8 (* 8 (- 3 i))) chunk)))
+            (replace p bytes :start1 9 :start2 pos :end2 (+ pos chunk))
+            (write-packet conn p (+ 9 chunk))))
         (sb-thread:with-mutex ((chan-window-lock c))
           (decf (chan-send-window c) chunk))
         (incf pos chunk)))))

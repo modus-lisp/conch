@@ -126,6 +126,10 @@
               collect (subseq s start pos)
               while pos))))
 
+(defun u32-at (v i)
+  "The big-endian u32 at V[I]."
+  (logior (ash (aref v i) 24) (ash (aref v (+ i 1)) 16) (ash (aref v (+ i 2)) 8) (aref v (+ i 3))))
+
 (defun be->integer (bytes)
   "Non-negative integer from big-endian BYTES."
   (let ((v 0)) (loop for b across bytes do (setf v (logior (ash v 8) b))) v))

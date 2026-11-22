@@ -47,7 +47,20 @@
   ;; send path is not re-entrant (a packet is framed, encrypted and counted
   ;; against SEND-SEQ, and interleaving two of those corrupts the stream and
   ;; desynchronises the cipher), so every writer takes this first.
-  (send-lock (sb-thread:make-mutex :name "conch-send")))
+  (send-lock (sb-thread:make-mutex :name "conch-send"))
+  ;; where each packet is read and decrypted: kept, so a download is not a fresh vector a packet
+  (recv-buf (make-array 0 :element-type '(unsigned-byte 8)) :type (simple-array (unsigned-byte 8) (*)))
+  ;; where each packet is built to be sent, and each channel-data payload before it: kept too (both are used
+  ;; under SEND-LOCK only, and done with once the packet is written)
+  (send-buf (make-array 0 :element-type '(unsigned-byte 8)) :type (simple-array (unsigned-byte 8) (*)))
+  (data-buf (make-array 0 :element-type '(unsigned-byte 8)) :type (simple-array (unsigned-byte 8) (*))))
+
+(defun %conn-room (conn slot n)
+  "The connection's buffer SLOT (:send or :data), at least N bytes long."
+  (let ((b (if (eq slot :send) (ssh-conn-send-buf conn) (ssh-conn-data-buf conn))))
+    (if (>= (length b) n) b
+        (let ((new (make-array (max n 36000) :element-type '(unsigned-byte 8))))
+          (if (eq slot :send) (setf (ssh-conn-send-buf conn) new) (setf (ssh-conn-data-buf conn) new))))))
 
 ;;; ---- socket I/O ------------------------------------------------------------
 (defun resolve-address (host)
@@ -62,10 +75,10 @@
                   sock :input t :output t :element-type '(unsigned-byte 8)
                   :buffering :none))))
 
-(defun send-raw (conn bytes)
+(defun send-raw (conn bytes &optional (end (length bytes)))
   (if (ssh-conn-via conn)
-      (chan-write (ssh-conn-via conn) bytes)
-      (progn (write-sequence bytes (ssh-conn-stream conn))
+      (chan-write (ssh-conn-via conn) bytes end)
+      (progn (write-sequence bytes (ssh-conn-stream conn) :end end)
              (force-output (ssh-conn-stream conn)))))
 
 (defvar *mid-packet* nil
@@ -121,6 +134,16 @@
       (ssh-protocol-error "short read (~d of ~d bytes) — connection closed" got n))
     buf))
 
+(defun read-exact-into (conn buf start end)
+  "BUF[START,END) filled from CONN, as READ-EXACT reads (its waits, its tunnel); returns BUF."
+  (when (ssh-conn-via conn)
+    (return-from read-exact-into (chan-read-into (ssh-conn-via conn) buf start end)))
+  (when *wait-hook* (await-input conn))
+  (let ((got (read-sequence buf (ssh-conn-stream conn) :start start :end end)))
+    (unless (= got end)
+      (ssh-protocol-error "short read (~d of ~d bytes) — connection closed" (- got start) (- end start)))
+    buf))
+
 ;;; ---- version exchange (RFC 4253 §4.2) --------------------------------------
 (defparameter *client-id* "SSH-2.0-conch_0.1"
   "Our identification string (without the trailing CR LF).")
@@ -143,15 +166,15 @@
              (return line)))
 
 ;;; ---- binary packet protocol (RFC 4253 §6) ----------------------------------
-(defun write-packet (conn payload)
+(defun write-packet (conn payload &optional (end (length payload)))
   "Frame, (encrypt,) and send PAYLOAD (a byte vector whose first byte is the
    message number).  Serialised on the connection's SEND-LOCK: framing and the
    sequence-number bump must be one atomic step, or two channels writing at once
    interleave their packets and desynchronise the cipher."
   (sb-thread:with-recursive-lock ((ssh-conn-send-lock conn))
     (if (ssh-conn-send-cipher conn)
-        (cipher-send-packet conn payload)
-        (plaintext-send-packet conn payload))
+        (cipher-send-packet conn payload end)
+        (plaintext-send-packet conn (if (= end (length payload)) payload (subseq payload 0 end))))
     (setf (ssh-conn-send-seq conn) (logand (1+ (ssh-conn-send-seq conn)) #xffffffff))))
 
 (defun plaintext-send-packet (conn payload)
@@ -173,6 +196,15 @@
              (plaintext-recv-packet conn))
     (setf (ssh-conn-recv-seq conn) (logand (1+ (ssh-conn-recv-seq conn)) #xffffffff))))
 
+(defun read-packet-in-place (conn)
+  "As READ-PACKET, but (values BUF START END): encrypted, the payload where it was decrypted (the connection's
+   buffer, good until the next read); before keys, a fresh vector."
+  (multiple-value-prog1
+      (if (ssh-conn-recv-cipher conn)
+          (cipher-recv-in-place conn)
+          (let ((p (plaintext-recv-packet conn))) (values p 0 (length p))))
+    (setf (ssh-conn-recv-seq conn) (logand (1+ (ssh-conn-recv-seq conn)) #xffffffff))))
+
 (defun plaintext-recv-packet (conn)
   (let* ((plen (be->integer (read-exact conn 4)))
          (rest (let ((*mid-packet* t)) (read-exact conn plen)))
@@ -183,20 +215,25 @@
 ;;; higher layers don't care about (IGNORE/DEBUG), and surfaces DISCONNECT.
 (defun read-payload (conn)
   (loop for p = (read-packet conn)
-        for msg = (aref p 0)
-        do (cond ((= msg +msg-ignore+))
-                 ((= msg +msg-debug+))
-                 ((= msg +msg-global-request+)          ; e.g. hostkeys-00@openssh.com
-                  (let ((r (make-reader p 1)))
-                    (r-cstring r)                        ; request name
-                    (when (r-bool r)                     ; want_reply → we don't support it
-                      (write-packet conn (make-array 1 :element-type '(unsigned-byte 8)
-                                                       :initial-element +msg-request-failure+)))))
-                 ((= msg +msg-disconnect+)
-                  (let ((r (make-reader p 1)))
-                    (let ((code (r-u32 r)) (desc (r-cstring r)))
-                      (ssh-protocol-error "server disconnected (~d): ~a" code desc))))
-                 (t (return p)))))
+        do (unless (housekeeping conn p) (return p))))
+
+(defun housekeeping (conn p)
+  "True if P was transport housekeeping, now dealt with (IGNORE, DEBUG, a global request); DISCONNECT signals."
+  (let ((msg (aref p 0)))
+    (cond ((= msg +msg-ignore+) t)
+          ((= msg +msg-debug+) t)
+          ((= msg +msg-global-request+)          ; e.g. hostkeys-00@openssh.com
+           (let ((r (make-reader p 1)))
+             (r-cstring r)                        ; request name
+             (when (r-bool r)                     ; want_reply → we don't support it
+               (write-packet conn (make-array 1 :element-type '(unsigned-byte 8)
+                                                :initial-element +msg-request-failure+))))
+           t)
+          ((= msg +msg-disconnect+)
+           (let ((r (make-reader p 1)))
+             (let ((code (r-u32 r)) (desc (r-cstring r)))
+               (ssh-protocol-error "server disconnected (~d): ~a" code desc))))
+          (t nil))))
 
 (defun expect-msg (conn number what)
   (let ((p (read-payload conn)))

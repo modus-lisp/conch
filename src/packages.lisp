@@ -30,6 +30,7 @@
    ;; sftp
    #:with-sftp #:sftp-open-session
    #:sftp-get #:sftp-put #:sftp-ls #:sftp-realpath
+   #:sftp-map-file #:sftp-open-write #:sftp-write #:sftp-finish-write #:sftp-abandon-write
    #:sftp-mkdir #:sftp-rmdir #:sftp-remove
    #:open-direct-tcpip #:exec-lines #:sftp-walk #:sftp-tree-contents #:sftp-delete-paths #:sftp-lstat-many #:sftp-statvfs #:sftp-get-many #:sftp-request #:sftp-response #:sftp-call #:sftp-peek-dirs #:sftp-read-range #:sftp-write-range #:*sftp-window* #:*sftp-chunk*
    #:sftp-entries #:sftp-map-entries #:sftp-entry #:sftp-entry-name #:sftp-entry-attrs #:sftp-entry-size
