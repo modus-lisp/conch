@@ -565,6 +565,12 @@
 (defun sftp-mkdir (s path)
   (sftp-ok-of s (sftp-request s +fxp-mkdir+ (lambda (w) (w-string w path) (w-u32 w 0))) "mkdir"))
 
+(defun sftp-set-mtime (s path mtime)
+  "Set PATH's modification (and access) time to MTIME, seconds since 1970 (SSH_FXP_SETSTAT): a copied file
+   given its source's time, so the next copy's size-and-time check can tell it is the same."
+  (sftp-ok-of s (sftp-request s 9 (lambda (w) (w-string w path) (w-u32 w 8) (w-u32 w mtime) (w-u32 w mtime)))
+              "setstat"))
+
 (defun sftp-rmdir (s path)
   (sftp-ok-of s (%path-request s +fxp-rmdir+ path) "rmdir"))
 

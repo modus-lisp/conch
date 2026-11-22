@@ -33,7 +33,7 @@
    #:sftp-mkdir #:sftp-rmdir #:sftp-remove
    #:open-direct-tcpip #:exec-lines #:sftp-walk #:sftp-tree-contents #:sftp-delete-paths #:sftp-lstat-many #:sftp-statvfs #:sftp-get-many #:sftp-request #:sftp-response #:sftp-call #:sftp-peek-dirs #:sftp-read-range #:sftp-write-range #:*sftp-window* #:*sftp-chunk*
    #:sftp-entries #:sftp-map-entries #:sftp-entry #:sftp-entry-name #:sftp-entry-attrs #:sftp-entry-size
-   #:sftp-entry-mtime #:sftp-entry-kind #:sftp-stat #:sftp-lstat #:sftp-rename #:attrs-kind
+   #:sftp-entry-mtime #:sftp-entry-kind #:sftp-stat #:sftp-lstat #:sftp-rename #:sftp-set-mtime #:attrs-kind
    #:known-hosts-trust #:ssh-host-key-blob #:ssh-host-key-kind
    #:userauth-methods #:userauth-password #:userauth-keyboard-interactive #:userauth-with-password
    #:sftp-download #:sftp-upload #:sftp-list
